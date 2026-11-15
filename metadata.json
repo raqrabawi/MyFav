@@ -1,0 +1,6 @@
+{
+  "name": "MyFav — Personal Web Curator",
+  "description": "MyFav — A dark-mode glassmorphic personal web directory to save, organize, and launch your favorite websites across customizable categories and subcategories.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
