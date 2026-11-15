@@ -36,6 +36,7 @@ import {
   Zap,
   RefreshCw,
   StarOff,
+  LogIn,
 } from 'lucide-react';
 import {
   onAuthStateChanged,
@@ -44,6 +45,7 @@ import {
 import {
   collection,
   doc,
+  getDocs,
   onSnapshot,
   query,
   where,
@@ -110,6 +112,7 @@ import { ChromeImportModal } from './components/ChromeImportModal';
 import { MyFavLogo } from './components/MyFavLogo';
 import { ShareCategoryModal } from './components/ShareCategoryModal';
 import { SharedCollectionView } from './components/SharedCollectionView';
+import { AccountSyncModal } from './components/AccountSyncModal';
 
 const STORAGE_KEYS = {
   CATEGORIES: 'aethermark_categories_v1',
@@ -118,6 +121,7 @@ const STORAGE_KEYS = {
   QUICK_SHORTCUTS: 'aethermark_quick_shortcuts_v1',
   CHROME_SYNC_META: 'aethermark_chrome_sync_meta_v1',
   CHROME_CACHED_PLAN: 'aethermark_chrome_cached_plan_v1',
+  CLOUD_LINKED_UID: 'aethermark_cloud_linked_uid_v1',
 };
 
 const WIN_DEFAULT_CHROME_PATH = `%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default\\Bookmarks`;
@@ -137,10 +141,25 @@ function timestampToIso(val: unknown): string {
 }
 
 export default function App() {
-  // Auth & Cloud State
+  // Auth & Cloud Sync Gate State
   const [user, setUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [cloudLoading, setCloudLoading] = useState(false);
+  const freshSignInTriggeredRef = useRef(false);
+  const [syncGateStatus, setSyncGateStatus] = useState<
+    'idle' | 'checking' | 'awaiting_choice' | 'ready'
+  >('idle');
+  const [pendingSyncChoice, setPendingSyncChoice] = useState<{
+    targetUser: User;
+    localCategories: CategoryItem[];
+    localBookmarks: BookmarkItem[];
+    localShortcuts: QuickShortcutItem[];
+    cloudCategories: CategoryItem[];
+    cloudBookmarks: BookmarkItem[];
+    cloudShortcuts: QuickShortcutItem[];
+  } | null>(null);
+  const [isSyncChoiceProcessing, setIsSyncChoiceProcessing] = useState(false);
+  const [syncChoiceError, setSyncChoiceError] = useState('');
 
   // Local / Synced Data State — automatically purges all previous demo categories, subcategories, and websites
   const [categories, setCategories] = useState<CategoryItem[]>(() => {
@@ -208,6 +227,15 @@ export default function App() {
     }
     return [];
   });
+
+  const localCategoriesRef = useRef<CategoryItem[]>(categories);
+  const localBookmarksRef = useRef<BookmarkItem[]>(bookmarks);
+  const localQuickShortcutsRef = useRef<QuickShortcutItem[]>(quickShortcuts);
+  if (!user) {
+    localCategoriesRef.current = categories;
+    localBookmarksRef.current = bookmarks;
+    localQuickShortcutsRef.current = quickShortcuts;
+  }
 
   // Page Navigation & Filtering State
   const [activeView, setActiveView] = useState<
@@ -392,20 +420,179 @@ export default function App() {
     trackPageView(pagePath, pageTitle);
   }, [activeView, selectedCategoryId, activeShareId]);
 
-  // Firebase Auth listener
+  const handleGoogleLogin = async () => {
+    freshSignInTriggeredRef.current = true;
+    setSyncChoiceError('');
+    try {
+      await signInWithGoogle();
+    } catch (error) {
+      freshSignInTriggeredRef.current = false;
+      const code =
+        typeof error === 'object' && error !== null && 'code' in error
+          ? String((error as { code?: string }).code)
+          : '';
+      if (
+        code === 'auth/popup-closed-by-user' ||
+        code === 'auth/cancelled-popup-request'
+      ) {
+        return;
+      }
+      console.error('Google sign-in failed:', error);
+    }
+  };
+
+  const handleSignOut = async () => {
+    try {
+      localStorage.removeItem(STORAGE_KEYS.CLOUD_LINKED_UID);
+    } catch {
+      // ignore
+    }
+    setPendingSyncChoice(null);
+    setSyncGateStatus('idle');
+    await signOutUser();
+  };
+
+  // Firebase Auth listener with pre-sync decision gate on login
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (currentUser) => {
+    let cancelled = false;
+    const unsub = onAuthStateChanged(auth, async (currentUser) => {
+      if (cancelled) return;
+
+      if (!currentUser) {
+        freshSignInTriggeredRef.current = false;
+        setUser(null);
+        setAuthReady(true);
+        setSyncGateStatus('idle');
+        setPendingSyncChoice(null);
+        setCloudLoading(false);
+        return;
+      }
+
       setUser(currentUser);
       setAuthReady(true);
+
+      let linkedUid: string | null = null;
+      try {
+        linkedUid = localStorage.getItem(STORAGE_KEYS.CLOUD_LINKED_UID);
+      } catch {
+        // ignore
+      }
+
+      const wasTriggeredByLogin = freshSignInTriggeredRef.current;
+      freshSignInTriggeredRef.current = false;
+
+      // Returning session for already-linked account: attach listeners seamlessly
+      if (!wasTriggeredByLogin && linkedUid === currentUser.uid) {
+        setPendingSyncChoice(null);
+        setSyncGateStatus('ready');
+        return;
+      }
+
+      // Fresh Google login or unlinked account: inspect local vs cloud data and prompt user
+      setSyncGateStatus('checking');
+      setCloudLoading(true);
+      setSyncChoiceError('');
+
+      try {
+        const [catSnap, bmSnap, scSnap] = await Promise.all([
+          getDocs(
+            query(collection(db, 'categories'), where('ownerId', '==', currentUser.uid))
+          ),
+          getDocs(
+            query(collection(db, 'bookmarks'), where('ownerId', '==', currentUser.uid))
+          ),
+          getDocs(
+            query(collection(db, 'quickShortcuts'), where('ownerId', '==', currentUser.uid))
+          ),
+        ]);
+
+        if (cancelled) return;
+
+        const cloudCategories: CategoryItem[] = catSnap.docs
+          .filter((docSnap) => !DEMO_CATEGORY_IDS.has(docSnap.id))
+          .map((docSnap) => {
+            const d = docSnap.data();
+            return {
+              id: docSnap.id,
+              ownerId: d.ownerId,
+              name: d.name,
+              icon: d.icon,
+              parentId: d.parentId || '',
+              order: typeof d.order === 'number' ? d.order : 0,
+              createdAt: timestampToIso(d.createdAt),
+              updatedAt: timestampToIso(d.updatedAt),
+            };
+          });
+
+        const cloudBookmarks: BookmarkItem[] = bmSnap.docs
+          .filter(
+            (docSnap) =>
+              !DEMO_BOOKMARK_IDS.has(docSnap.id) &&
+              !DEMO_CATEGORY_IDS.has(docSnap.data()?.categoryId)
+          )
+          .map((docSnap) => {
+            const d = docSnap.data();
+            return {
+              id: docSnap.id,
+              ownerId: d.ownerId,
+              title: d.title,
+              url: d.url,
+              description: d.description || '',
+              categoryId: d.categoryId,
+              subcategoryId: d.subcategoryId || '',
+              isFavorite: Boolean(d.isFavorite),
+              createdAt: timestampToIso(d.createdAt),
+              updatedAt: timestampToIso(d.updatedAt),
+            };
+          });
+
+        const cloudShortcuts: QuickShortcutItem[] = scSnap.docs.map((docSnap) => {
+          const d = docSnap.data();
+          return {
+            id: docSnap.id,
+            ownerId: d.ownerId,
+            title: d.title,
+            url: d.url,
+            iconType: (d.iconType as QuickShortcutIconType) || 'favicon',
+            customIcon: d.customIcon || '',
+            order: typeof d.order === 'number' ? d.order : 0,
+            createdAt: timestampToIso(d.createdAt),
+            updatedAt: timestampToIso(d.updatedAt),
+          };
+        });
+
+        setPendingSyncChoice({
+          targetUser: currentUser,
+          localCategories: localCategoriesRef.current,
+          localBookmarks: localBookmarksRef.current,
+          localShortcuts: localQuickShortcutsRef.current,
+          cloudCategories,
+          cloudBookmarks,
+          cloudShortcuts,
+        });
+        setSyncGateStatus('awaiting_choice');
+        setCloudLoading(false);
+      } catch (error) {
+        if (cancelled) return;
+        setCloudLoading(false);
+        setSyncGateStatus('ready');
+        console.error('Could not check existing cloud data:', error);
+      }
     });
-    return () => unsub();
+
+    return () => {
+      cancelled = true;
+      unsub();
+    };
   }, []);
 
-  // Firestore real-time synchronization when signed in (purges any demo categories/bookmarks)
+  // Firestore real-time synchronization when signed in & sync choice resolved
   useEffect(() => {
-    if (!authReady || !user) {
-      setSharedCategories([]);
-      setCloudLoading(false);
+    if (!authReady || !user || syncGateStatus !== 'ready') {
+      if (!user) {
+        setSharedCategories([]);
+        setCloudLoading(false);
+      }
       return;
     }
 
@@ -424,9 +611,6 @@ export default function App() {
       where('ownerId', '==', user.uid)
     );
     const settingsDocRef = doc(db, 'userSettings', user.uid);
-
-    let migratedLocalToCloud = false;
-    let migratedShortcutsToCloud = false;
 
     const unsubCategories = onSnapshot(
       categoriesQuery,
@@ -447,63 +631,6 @@ export default function App() {
           (docSnap) => !DEMO_CATEGORY_IDS.has(docSnap.id)
         );
 
-        // If user just signed in with Google and has local categories/bookmarks, auto-sync them to Cloud!
-        if (validDocs.length === 0 && !migratedLocalToCloud && categories.length > 0) {
-          migratedLocalToCloud = true;
-          try {
-            const roots = categories.filter((c) => c.parentId === '');
-            for (const root of roots) {
-              await setDoc(doc(db, 'categories', root.id), {
-                ownerId: user.uid,
-                name: root.name.slice(0, 80),
-                icon: root.icon || 'bookmark',
-                parentId: '',
-                order: root.order,
-                createdAt: serverTimestamp(),
-                updatedAt: serverTimestamp(),
-              });
-            }
-            const subs = categories.filter((c) => c.parentId !== '');
-            for (const sub of subs) {
-              await setDoc(doc(db, 'categories', sub.id), {
-                ownerId: user.uid,
-                name: sub.name.slice(0, 80),
-                icon: sub.icon || 'bookmark',
-                parentId: sub.parentId,
-                order: sub.order,
-                createdAt: serverTimestamp(),
-                updatedAt: serverTimestamp(),
-              });
-            }
-            const migratedCatIds = new Set([
-              ...roots.map((r) => r.id),
-              ...subs.map((s) => s.id),
-            ]);
-            for (const bm of bookmarks) {
-              if (!migratedCatIds.has(bm.categoryId)) continue;
-              const safeSubId =
-                bm.subcategoryId && migratedCatIds.has(bm.subcategoryId)
-                  ? bm.subcategoryId
-                  : '';
-              await setDoc(doc(db, 'bookmarks', bm.id), {
-                ownerId: user.uid,
-                title: bm.title.slice(0, 120),
-                url: bm.url.slice(0, 500),
-                description: bm.description.slice(0, 400),
-                categoryId: bm.categoryId,
-                subcategoryId: safeSubId,
-                isFavorite: Boolean(bm.isFavorite),
-                createdAt: serverTimestamp(),
-                updatedAt: serverTimestamp(),
-              });
-            }
-          } catch (error) {
-            handleFirestoreError(error, OperationType.WRITE, 'categories');
-          }
-          setCloudLoading(false);
-          return;
-        }
-
         const loadedCategories: CategoryItem[] = validDocs.map((docSnap) => {
           const d = docSnap.data();
           return {
@@ -518,9 +645,6 @@ export default function App() {
           };
         });
         setCategories(loadedCategories);
-        if (loadedCategories.length === 0 && !migratedLocalToCloud) {
-          setActiveView('settings');
-        }
         setCloudLoading(false);
       },
       (error) => {
@@ -578,31 +702,6 @@ export default function App() {
     const unsubQuickShortcuts = onSnapshot(
       quickShortcutsQuery,
       async (snapshot) => {
-        if (
-          snapshot.docs.length === 0 &&
-          !migratedShortcutsToCloud &&
-          quickShortcuts.length > 0
-        ) {
-          migratedShortcutsToCloud = true;
-          try {
-            for (const sc of quickShortcuts) {
-              await setDoc(doc(db, 'quickShortcuts', sc.id), {
-                ownerId: user.uid,
-                title: sc.title.slice(0, 80),
-                url: sc.url.slice(0, 500),
-                iconType: sc.iconType || 'favicon',
-                customIcon: (sc.customIcon || '').slice(0, 500),
-                order: typeof sc.order === 'number' ? sc.order : 0,
-                createdAt: serverTimestamp(),
-                updatedAt: serverTimestamp(),
-              });
-            }
-          } catch (error) {
-            handleFirestoreError(error, OperationType.WRITE, 'quickShortcuts');
-          }
-          return;
-        }
-
         const loadedShortcuts: QuickShortcutItem[] = snapshot.docs
           .map((docSnap) => {
             const d = docSnap.data();
@@ -684,7 +783,395 @@ export default function App() {
       unsubSettings();
       unsubSharedCategories();
     };
-  }, [authReady, user]);
+  }, [authReady, user, syncGateStatus]);
+
+  // Decision Handlers for AccountSyncModal (Sync Local to Cloud / Keep Local / Get Cloud & Sync / Fresh Start)
+  const handleChoiceSyncLocalToCloud = async () => {
+    if (!pendingSyncChoice) return;
+    const {
+      targetUser,
+      localCategories,
+      localBookmarks,
+      localShortcuts,
+      cloudCategories,
+      cloudBookmarks,
+      cloudShortcuts,
+    } = pendingSyncChoice;
+
+    setIsSyncChoiceProcessing(true);
+    setSyncChoiceError('');
+
+    const isCleanId = (id: string) => /^[a-zA-Z0-9_-]{1,128}$/.test(id);
+    const cleanIcon = (icon: string) =>
+      /^[a-zA-Z0-9_-]{1,40}$/.test(icon || '') ? icon : 'bookmark';
+
+    try {
+      const catIdMap: Record<string, string> = {};
+      const existingCloudRootsByName = new Map<string, CategoryItem>();
+      const existingCloudSubsByKey = new Map<string, CategoryItem>();
+
+      for (const cc of cloudCategories) {
+        if (cc.parentId === '') {
+          existingCloudRootsByName.set(cc.name.trim().toLowerCase(), cc);
+        }
+      }
+      for (const cc of cloudCategories) {
+        if (cc.parentId !== '') {
+          existingCloudSubsByKey.set(
+            `${cc.parentId}::${cc.name.trim().toLowerCase()}`,
+            cc
+          );
+        }
+      }
+
+      const localRoots = localCategories
+        .filter((c) => c.parentId === '')
+        .sort((a, b) => a.order - b.order);
+      const localSubs = localCategories
+        .filter((c) => c.parentId !== '')
+        .sort((a, b) => a.order - b.order);
+
+      // 1. Write Root Categories first so exists(parentId) passes for subcategories
+      let nextRootOrder = cloudCategories.filter((c) => c.parentId === '').length;
+      const rootWrites: { id: string; data: Record<string, unknown> }[] = [];
+      for (const root of localRoots) {
+        const match = existingCloudRootsByName.get(root.name.trim().toLowerCase());
+        if (match) {
+          catIdMap[root.id] = match.id;
+          continue;
+        }
+        const docId =
+          isCleanId(root.id) && !cloudCategories.some((c) => c.id === root.id)
+            ? root.id
+            : generateCleanId('cat');
+        catIdMap[root.id] = docId;
+        rootWrites.push({
+          id: docId,
+          data: {
+            ownerId: targetUser.uid,
+            name: root.name.trim().slice(0, 80) || 'Untitled',
+            icon: cleanIcon(root.icon),
+            parentId: '',
+            order: Math.min(100000, Math.max(0, nextRootOrder++)),
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          },
+        });
+      }
+
+      const CHUNK_SIZE = 450;
+      for (let i = 0; i < rootWrites.length; i += CHUNK_SIZE) {
+        const batch = writeBatch(db);
+        for (const item of rootWrites.slice(i, i + CHUNK_SIZE)) {
+          batch.set(doc(db, 'categories', item.id), item.data);
+        }
+        try {
+          await batch.commit();
+        } catch (error) {
+          handleFirestoreError(error, OperationType.WRITE, 'categories');
+        }
+      }
+
+      // 2. Write Subcategories after Root Categories exist
+      const subWrites: { id: string; data: Record<string, unknown> }[] = [];
+      for (const sub of localSubs) {
+        const mappedParentId = catIdMap[sub.parentId];
+        if (!mappedParentId) continue;
+        const match = existingCloudSubsByKey.get(
+          `${mappedParentId}::${sub.name.trim().toLowerCase()}`
+        );
+        if (match) {
+          catIdMap[sub.id] = match.id;
+          continue;
+        }
+        const docId =
+          isCleanId(sub.id) && !cloudCategories.some((c) => c.id === sub.id)
+            ? sub.id
+            : generateCleanId('sub');
+        catIdMap[sub.id] = docId;
+        subWrites.push({
+          id: docId,
+          data: {
+            ownerId: targetUser.uid,
+            name: sub.name.trim().slice(0, 80) || 'Subcategory',
+            icon: cleanIcon(sub.icon),
+            parentId: mappedParentId,
+            order: Math.min(100000, Math.max(0, sub.order || 0)),
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          },
+        });
+      }
+
+      for (let i = 0; i < subWrites.length; i += CHUNK_SIZE) {
+        const batch = writeBatch(db);
+        for (const item of subWrites.slice(i, i + CHUNK_SIZE)) {
+          batch.set(doc(db, 'categories', item.id), item.data);
+        }
+        try {
+          await batch.commit();
+        } catch (error) {
+          handleFirestoreError(error, OperationType.WRITE, 'categories');
+        }
+      }
+
+      // 3. Write Bookmarks & Quick Shortcuts (deduplicated by URL)
+      const existingUrls = new Set(
+        cloudBookmarks.map((b) => b.url.trim().toLowerCase())
+      );
+      const validCatIds = new Set([
+        ...cloudCategories.map((c) => c.id),
+        ...Object.values(catIdMap),
+      ]);
+
+      const bmWrites: { id: string; data: Record<string, unknown> }[] = [];
+      for (const bm of localBookmarks) {
+        const cleanUrl = bm.url.trim().slice(0, 500);
+        if (!/^https?:\/\/.+/i.test(cleanUrl)) continue;
+        if (existingUrls.has(cleanUrl.toLowerCase())) continue;
+
+        const mappedCatId = catIdMap[bm.categoryId] || bm.categoryId;
+        if (!validCatIds.has(mappedCatId)) continue;
+        const mappedSubId = bm.subcategoryId
+          ? catIdMap[bm.subcategoryId] || bm.subcategoryId
+          : '';
+        const safeSubId = mappedSubId && validCatIds.has(mappedSubId) ? mappedSubId : '';
+
+        existingUrls.add(cleanUrl.toLowerCase());
+        const bmDocId =
+          isCleanId(bm.id) && !cloudBookmarks.some((c) => c.id === bm.id)
+            ? bm.id
+            : generateCleanId('bm');
+
+        bmWrites.push({
+          id: bmDocId,
+          data: {
+            ownerId: targetUser.uid,
+            title: bm.title.trim().slice(0, 120) || cleanUrl.slice(0, 120),
+            url: cleanUrl,
+            description: (bm.description || '').slice(0, 400),
+            categoryId: mappedCatId,
+            subcategoryId: safeSubId,
+            isFavorite: Boolean(bm.isFavorite),
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          },
+        });
+      }
+
+      for (let i = 0; i < bmWrites.length; i += CHUNK_SIZE) {
+        const batch = writeBatch(db);
+        for (const item of bmWrites.slice(i, i + CHUNK_SIZE)) {
+          batch.set(doc(db, 'bookmarks', item.id), item.data);
+        }
+        try {
+          await batch.commit();
+        } catch (error) {
+          handleFirestoreError(error, OperationType.WRITE, 'bookmarks');
+        }
+      }
+
+      const existingShortcutUrls = new Set(
+        cloudShortcuts.map((s) => s.url.trim().toLowerCase())
+      );
+      let nextShortcutOrder = cloudShortcuts.length;
+      const scWrites: { id: string; data: Record<string, unknown> }[] = [];
+      for (const sc of localShortcuts) {
+        const cleanUrl = sc.url.trim().slice(0, 500);
+        if (!/^https?:\/\/.+/i.test(cleanUrl)) continue;
+        if (existingShortcutUrls.has(cleanUrl.toLowerCase())) continue;
+        existingShortcutUrls.add(cleanUrl.toLowerCase());
+
+        const scDocId =
+          isCleanId(sc.id) && !cloudShortcuts.some((c) => c.id === sc.id)
+            ? sc.id
+            : generateCleanId('qs');
+        const iconType =
+          sc.iconType === 'lucide' || sc.iconType === 'custom'
+            ? sc.iconType
+            : 'favicon';
+        const customIcon =
+          iconType === 'favicon' ? '' : (sc.customIcon || '').trim().slice(0, 500);
+
+        scWrites.push({
+          id: scDocId,
+          data: {
+            ownerId: targetUser.uid,
+            title: sc.title.trim().slice(0, 80) || 'Shortcut',
+            url: cleanUrl,
+            iconType,
+            customIcon,
+            order: Math.min(100000, Math.max(0, nextShortcutOrder++)),
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          },
+        });
+      }
+
+      for (let i = 0; i < scWrites.length; i += CHUNK_SIZE) {
+        const batch = writeBatch(db);
+        for (const item of scWrites.slice(i, i + CHUNK_SIZE)) {
+          batch.set(doc(db, 'quickShortcuts', item.id), item.data);
+        }
+        try {
+          await batch.commit();
+        } catch (error) {
+          handleFirestoreError(error, OperationType.WRITE, 'quickShortcuts');
+        }
+      }
+
+      try {
+        localStorage.setItem(STORAGE_KEYS.CLOUD_LINKED_UID, targetUser.uid);
+        localStorage.setItem(STORAGE_KEYS.CATEGORIES, JSON.stringify([]));
+        localStorage.setItem(STORAGE_KEYS.BOOKMARKS, JSON.stringify([]));
+        localStorage.setItem(STORAGE_KEYS.QUICK_SHORTCUTS, JSON.stringify([]));
+      } catch {
+        // ignore
+      }
+
+      setPendingSyncChoice(null);
+      setSyncGateStatus('ready');
+      setLiveSyncToast('Synced your data to Google account');
+      setTimeout(() => setLiveSyncToast(null), 3500);
+    } catch (err) {
+      setSyncChoiceError(
+        err instanceof Error ? err.message : 'Failed to sync local data to Google.'
+      );
+    } finally {
+      setIsSyncChoiceProcessing(false);
+    }
+  };
+
+  const handleChoiceKeepLocalOnly = async () => {
+    setIsSyncChoiceProcessing(true);
+    setSyncChoiceError('');
+    try {
+      try {
+        localStorage.removeItem(STORAGE_KEYS.CLOUD_LINKED_UID);
+      } catch {
+        // ignore
+      }
+      setPendingSyncChoice(null);
+      setSyncGateStatus('idle');
+      await signOutUser();
+      setLiveSyncToast('Keeping websites & categories locally on this computer');
+      setTimeout(() => setLiveSyncToast(null), 3500);
+    } catch (err) {
+      setSyncChoiceError(
+        err instanceof Error ? err.message : 'Failed to switch back to local mode.'
+      );
+    } finally {
+      setIsSyncChoiceProcessing(false);
+    }
+  };
+
+  const handleChoiceGetCloudAndSync = async () => {
+    if (!pendingSyncChoice) return;
+    setIsSyncChoiceProcessing(true);
+    setSyncChoiceError('');
+    try {
+      try {
+        localStorage.setItem(
+          STORAGE_KEYS.CLOUD_LINKED_UID,
+          pendingSyncChoice.targetUser.uid
+        );
+        localStorage.setItem(STORAGE_KEYS.CATEGORIES, JSON.stringify([]));
+        localStorage.setItem(STORAGE_KEYS.BOOKMARKS, JSON.stringify([]));
+        localStorage.setItem(STORAGE_KEYS.QUICK_SHORTCUTS, JSON.stringify([]));
+      } catch {
+        // ignore
+      }
+      setSelectedCategoryId('all');
+      setSelectedSubcategoryId('all');
+      setPendingSyncChoice(null);
+      setSyncGateStatus('ready');
+      setLiveSyncToast('Synced saved data from your Google account');
+      setTimeout(() => setLiveSyncToast(null), 3500);
+    } finally {
+      setIsSyncChoiceProcessing(false);
+    }
+  };
+
+  const handleChoiceStartFresh = async (goToChromeSync = false) => {
+    if (!pendingSyncChoice) return;
+    const { targetUser } = pendingSyncChoice;
+    setIsSyncChoiceProcessing(true);
+    setSyncChoiceError('');
+
+    try {
+      const [scSnap, bmSnap, catSnap, shareSnap] = await Promise.all([
+        getDocs(
+          query(collection(db, 'quickShortcuts'), where('ownerId', '==', targetUser.uid))
+        ),
+        getDocs(
+          query(collection(db, 'bookmarks'), where('ownerId', '==', targetUser.uid))
+        ),
+        getDocs(
+          query(collection(db, 'categories'), where('ownerId', '==', targetUser.uid))
+        ),
+        getDocs(
+          query(collection(db, 'sharedCategories'), where('ownerId', '==', targetUser.uid))
+        ),
+      ]);
+
+      const deleteRefs = [
+        ...scSnap.docs.map((d) => ({ ref: d.ref, col: 'quickShortcuts' })),
+        ...bmSnap.docs.map((d) => ({ ref: d.ref, col: 'bookmarks' })),
+        ...shareSnap.docs.map((d) => ({ ref: d.ref, col: 'sharedCategories' })),
+        ...catSnap.docs
+          .filter((d) => Boolean(d.data()?.parentId))
+          .map((d) => ({ ref: d.ref, col: 'categories' })),
+        ...catSnap.docs
+          .filter((d) => !d.data()?.parentId)
+          .map((d) => ({ ref: d.ref, col: 'categories' })),
+      ];
+
+      const CHUNK_SIZE = 450;
+      for (let i = 0; i < deleteRefs.length; i += CHUNK_SIZE) {
+        const chunk = deleteRefs.slice(i, i + CHUNK_SIZE);
+        const batch = writeBatch(db);
+        for (const item of chunk) {
+          batch.delete(item.ref);
+        }
+        try {
+          await batch.commit();
+        } catch (error) {
+          handleFirestoreError(error, OperationType.DELETE, chunk[0]?.col || 'bookmarks');
+        }
+      }
+
+      setCategories([]);
+      setBookmarks([]);
+      setQuickShortcuts([]);
+      setSharedCategories([]);
+      setSelectedCategoryId('all');
+      setSelectedSubcategoryId('all');
+
+      try {
+        localStorage.setItem(STORAGE_KEYS.CLOUD_LINKED_UID, targetUser.uid);
+        localStorage.setItem(STORAGE_KEYS.CATEGORIES, JSON.stringify([]));
+        localStorage.setItem(STORAGE_KEYS.BOOKMARKS, JSON.stringify([]));
+        localStorage.setItem(STORAGE_KEYS.QUICK_SHORTCUTS, JSON.stringify([]));
+      } catch {
+        // ignore
+      }
+
+      setPendingSyncChoice(null);
+      setSyncGateStatus('ready');
+      if (goToChromeSync) {
+        setActiveView('chrome-sync');
+      } else {
+        setLiveSyncToast('Started a fresh cloud workspace');
+        setTimeout(() => setLiveSyncToast(null), 3500);
+      }
+    } catch (err) {
+      setSyncChoiceError(
+        err instanceof Error ? err.message : 'Failed to reset workspace.'
+      );
+    } finally {
+      setIsSyncChoiceProcessing(false);
+    }
+  };
 
   const sharedByCategoryId = useMemo(() => {
     const map: Record<string, SharedCategoryRecord> = {};
@@ -2663,17 +3150,10 @@ export default function App() {
                       </p>
                       <button
                         type="button"
-                        onClick={() => {
-                          setActiveView('settings');
-                          setTimeout(() => {
-                            document
-                              .getElementById('chrome-sync-settings-section')
-                              ?.scrollIntoView({ behavior: 'smooth' });
-                          }, 100);
-                        }}
+                        onClick={() => setActiveView('chrome-sync')}
                         className="w-full py-1.5 px-2.5 rounded-lg accent-subtle-bg accent-text text-[11px] font-semibold cursor-pointer"
                       >
-                        Import in Settings
+                        Sync Chrome
                       </button>
                     </div>
                   ) : (
@@ -3091,7 +3571,7 @@ export default function App() {
                   {user ? (
                     <button
                       type="button"
-                      onClick={signOutUser}
+                      onClick={() => void handleSignOut()}
                       className="text-[11px] text-slate-400 hover:text-white cursor-pointer shrink-0"
                     >
                       Sign Out
@@ -3099,10 +3579,10 @@ export default function App() {
                   ) : (
                     <button
                       type="button"
-                      onClick={signInWithGoogle}
+                      onClick={() => void handleGoogleLogin()}
                       className="text-[11px] font-semibold accent-text hover:underline cursor-pointer shrink-0"
                     >
-                      Sync
+                      Login
                     </button>
                   )}
                 </div>
@@ -3377,8 +3857,10 @@ export default function App() {
               <div className="pt-3 border-t border-white/8 w-full flex flex-col items-center">
                 <button
                   type="button"
-                  onClick={user ? signOutUser : signInWithGoogle}
-                  title={user ? `Signed in as ${user.email} (click to sign out)` : 'Sign in with Google to sync'}
+                  onClick={() =>
+                    void (user ? handleSignOut() : handleGoogleLogin())
+                  }
+                  title={user ? `Signed in as ${user.email} (click to sign out)` : 'Login with Google to sync'}
                   className="w-11 h-11 rounded-2xl bg-slate-950/60 border border-white/10 hover:border-white/25 flex items-center justify-center text-slate-300 hover:text-white transition-colors cursor-pointer"
                 >
                   <Cloud className={`w-4 h-4 ${user ? 'accent-text' : 'text-slate-500'}`} />
@@ -3416,12 +3898,8 @@ export default function App() {
               settings={settings}
               onUpdateSettings={handleUpdateSettings}
               user={user}
-              onSignIn={async () => {
-                await signInWithGoogle();
-              }}
-              onSignOut={async () => {
-                await signOutUser();
-              }}
+              onSignIn={handleGoogleLogin}
+              onSignOut={handleSignOut}
               onResetDefaults={handleClearEntireWorkspace}
               existingCategoryCount={categories.length}
               existingBookmarkCount={bookmarks.length}
@@ -3482,17 +3960,39 @@ export default function App() {
                   </p>
                 </div>
 
-                <button
-                  type="button"
-                  onClick={() => {
-                    setEditingBookmark(null);
-                    setIsBookmarkModalOpen(true);
-                  }}
-                  className="min-h-[38px] px-4 py-2 rounded-xl accent-bg text-white text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer shrink-0 shadow-lg shadow-black/20"
-                >
-                  <Plus className="w-3.5 h-3.5" />
-                  <span>Add Website</span>
-                </button>
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setActiveView('chrome-sync')}
+                    className="min-h-[38px] px-3.5 py-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-slate-200 hover:text-white text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                  >
+                    <Chrome className="w-3.5 h-3.5 accent-text" />
+                    <span>Sync Chrome</span>
+                  </button>
+
+                  {!user && (
+                    <button
+                      type="button"
+                      onClick={() => void handleGoogleLogin()}
+                      className="min-h-[38px] px-3.5 py-2 rounded-xl accent-subtle-bg hover:bg-white/15 border accent-border accent-text text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                    >
+                      <LogIn className="w-3.5 h-3.5" />
+                      <span>Login</span>
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEditingBookmark(null);
+                      setIsBookmarkModalOpen(true);
+                    }}
+                    className="min-h-[38px] px-4 py-2 rounded-xl accent-bg text-white text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0 shadow-lg shadow-black/20"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Add Website</span>
+                  </button>
+                </div>
               </div>
 
               {/* Top Quick Access Shortcuts Bar (Icon + Name only, opens in new window, customizable icon) */}
@@ -3900,12 +4400,12 @@ export default function App() {
                     <h2 className="text-base sm:text-lg font-semibold text-slate-100">
                       {searchQuery
                         ? 'No websites match your search'
-                        : 'All Demo Data Cleared — Ready for Your Chrome Bookmarks'}
+                        : 'Your Web Directory is Empty'}
                     </h2>
                     <p className="text-xs sm:text-sm text-slate-400 leading-relaxed">
                       {searchQuery
                         ? `No saved websites matched "${searchQuery}". Try clearing your search filter.`
-                        : 'All demo categories, subcategories, and websites have been removed. Click below to import your Chrome bookmarks with their exact folder & subfolder arrangement.'}
+                        : 'Import your Chrome bookmarks in Settings, sign in with Google to sync your saved sites, or create a category to begin.'}
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
@@ -3918,21 +4418,27 @@ export default function App() {
                         Clear Search
                       </button>
                     ) : (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setActiveView('settings');
-                          setTimeout(() => {
-                            document
-                              .getElementById('chrome-sync-settings-section')
-                              ?.scrollIntoView({ behavior: 'smooth' });
-                          }, 100);
-                        }}
-                        className="min-h-[44px] px-5 py-2.5 rounded-xl accent-bg text-white text-xs sm:text-sm font-semibold flex items-center gap-2 cursor-pointer shadow-lg"
-                      >
-                        <Chrome className="w-4 h-4" />
-                        <span>Sync Chrome in Settings</span>
-                      </button>
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => setActiveView('chrome-sync')}
+                          className="min-h-[44px] px-5 py-2.5 rounded-xl accent-bg text-white text-xs sm:text-sm font-semibold flex items-center gap-2 cursor-pointer shadow-lg"
+                        >
+                          <Chrome className="w-4 h-4" />
+                          <span>Sync Chrome</span>
+                        </button>
+
+                        {!user && (
+                          <button
+                            type="button"
+                            onClick={() => void handleGoogleLogin()}
+                            className="min-h-[44px] px-5 py-2.5 rounded-xl accent-subtle-bg hover:bg-white/15 border accent-border accent-text text-xs sm:text-sm font-semibold flex items-center gap-2 cursor-pointer"
+                          >
+                            <LogIn className="w-4 h-4" />
+                            <span>Login with Google</span>
+                          </button>
+                        )}
+                      </>
                     )}
                     <button
                       type="button"
@@ -4426,15 +4932,47 @@ export default function App() {
           bookmarks={bookmarks}
           existingShare={sharedByCategoryId[sharingCategory.id] || null}
           user={user}
-          onSignIn={async () => {
-            await signInWithGoogle();
-          }}
+          onSignIn={handleGoogleLogin}
           onPublishOrUpdateShare={handlePublishOrUpdateShare}
           onRevokeShare={handleRevokeShare}
           onPreviewSharedPage={handleOpenSharePreview}
           onClose={() => setSharingCategory(null)}
         />
       )}
+
+      <AccountSyncModal
+        isOpen={syncGateStatus === 'awaiting_choice' && pendingSyncChoice !== null}
+        userEmail={pendingSyncChoice?.targetUser.email || ''}
+        userName={pendingSyncChoice?.targetUser.displayName}
+        hasLocalData={Boolean(
+          pendingSyncChoice &&
+            (pendingSyncChoice.localCategories.length > 0 ||
+              pendingSyncChoice.localBookmarks.length > 0 ||
+              pendingSyncChoice.localShortcuts.length > 0)
+        )}
+        hasCloudData={Boolean(
+          pendingSyncChoice &&
+            (pendingSyncChoice.cloudCategories.length > 0 ||
+              pendingSyncChoice.cloudBookmarks.length > 0 ||
+              pendingSyncChoice.cloudShortcuts.length > 0)
+        )}
+        localCounts={{
+          categories: pendingSyncChoice?.localCategories.length || 0,
+          bookmarks: pendingSyncChoice?.localBookmarks.length || 0,
+          shortcuts: pendingSyncChoice?.localShortcuts.length || 0,
+        }}
+        cloudCounts={{
+          categories: pendingSyncChoice?.cloudCategories.length || 0,
+          bookmarks: pendingSyncChoice?.cloudBookmarks.length || 0,
+          shortcuts: pendingSyncChoice?.cloudShortcuts.length || 0,
+        }}
+        isProcessing={isSyncChoiceProcessing}
+        error={syncChoiceError}
+        onSyncLocalToCloud={handleChoiceSyncLocalToCloud}
+        onKeepLocalOnly={handleChoiceKeepLocalOnly}
+        onGetCloudAndSync={handleChoiceGetCloudAndSync}
+        onStartFresh={handleChoiceStartFresh}
+      />
     </div>
   );
 }
