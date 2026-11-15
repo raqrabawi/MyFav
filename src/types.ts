@@ -77,6 +77,17 @@ export interface ThemePreset {
   rgb: string;
 }
 
+export interface ImportProgressState {
+  phase: 'reading' | 'preparing' | 'categories' | 'bookmarks' | 'complete';
+  processed: number;
+  total: number;
+  addedBookmarks: number;
+  addedCategories: number;
+  skippedDuplicates: number;
+  currentTitle?: string;
+  sourceLabel?: string;
+}
+
 export interface UserSettings {
   ownerId: string;
   themeMode?: ThemeMode;

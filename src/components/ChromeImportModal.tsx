@@ -14,13 +14,16 @@ import {
   ChromeImportPlan,
   parseChromeBookmarksExactArrangement,
 } from '../utils/chromeBookmarksParser';
+import { ImportProgressState } from '../types';
+import { ImportProgressPanel } from './ImportProgressPanel';
 
 interface ChromeImportModalProps {
   isOpen: boolean;
   onClose: () => void;
   onImportExactPlan: (
     plan: ChromeImportPlan,
-    replaceAllExisting: boolean
+    replaceAllExisting: boolean,
+    onProgress?: (progress: ImportProgressState) => void
   ) => Promise<void>;
   linkedChromeFileName?: string | null;
   lastChromeSyncTime?: string | null;
@@ -46,6 +49,7 @@ export const ChromeImportModal: React.FC<ChromeImportModalProps> = ({
   const [copiedPath, setCopiedPath] = useState<'win' | 'mac' | null>(null);
   const [replaceAllExisting, setReplaceAllExisting] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
+  const [importProgress, setImportProgress] = useState<ImportProgressState | null>(null);
   const [isRefreshingLive, setIsRefreshingLive] = useState(false);
   const [showPasteBox, setShowPasteBox] = useState(false);
   const [pasteContent, setPasteContent] = useState('');
@@ -53,6 +57,14 @@ export const ChromeImportModal: React.FC<ChromeImportModalProps> = ({
   const [errorMsg, setErrorMsg] = useState('');
 
   if (!isOpen) return null;
+
+  const handleCloseModal = () => {
+    if (isImporting) return;
+    setImportProgress(null);
+    setStatusMsg('');
+    setErrorMsg('');
+    onClose();
+  };
 
   const handleSyncFromOs = async (os: 'win' | 'mac') => {
     const autoPath = os === 'win' ? WIN_CHROME_PATH : MAC_CHROME_PATH;
@@ -81,26 +93,35 @@ export const ChromeImportModal: React.FC<ChromeImportModalProps> = ({
     setStatusMsg('');
     const plan = parseChromeBookmarksExactArrangement(content);
     if (plan.bookmarks.length === 0 && plan.categories.length === 0) {
+      setImportProgress(null);
       setErrorMsg(
         'No bookmarks or folders were found. Please select your Chrome "Bookmarks" file or an exported bookmarks HTML file.'
       );
       return;
     }
 
-    const rootCount = plan.categories.filter((c) => c.parentTempId === '').length;
+    const totalUnits = Math.max(1, plan.categories.length + plan.bookmarks.length);
     setIsImporting(true);
-    setStatusMsg(
-      `${replaceAllExisting ? 'Importing' : 'Adding'} ${
-        plan.bookmarks.length
-      } bookmarks across ${rootCount} categories${
-        sourceLabel ? ` from "${sourceLabel}"` : ''
-      }...`
-    );
+    setImportProgress({
+      phase: 'categories',
+      processed: 0,
+      total: totalUnits,
+      addedBookmarks: 0,
+      addedCategories: 0,
+      skippedDuplicates: 0,
+      currentTitle: 'Preparing your links...',
+      sourceLabel,
+    });
 
     try {
-      await onImportExactPlan(plan, replaceAllExisting);
-      onClose();
+      await onImportExactPlan(plan, replaceAllExisting, (progress) => {
+        setImportProgress({
+          ...progress,
+          sourceLabel,
+        });
+      });
     } catch (err) {
+      setImportProgress(null);
       setErrorMsg(
         err instanceof Error ? err.message : 'Failed to import Chrome bookmarks.'
       );
@@ -110,12 +131,26 @@ export const ChromeImportModal: React.FC<ChromeImportModalProps> = ({
   };
 
   const handleFilePicked = (file: File) => {
+    setErrorMsg('');
+    setStatusMsg('');
+    setImportProgress({
+      phase: 'reading',
+      processed: 0,
+      total: 1,
+      addedBookmarks: 0,
+      addedCategories: 0,
+      skippedDuplicates: 0,
+      currentTitle: `Reading ${file.name}...`,
+      sourceLabel: file.name,
+    });
+
     const reader = new FileReader();
     reader.onload = (e) => {
       const text = typeof e.target?.result === 'string' ? e.target.result : '';
       handleProcessContent(text, file.name);
     };
     reader.onerror = () => {
+      setImportProgress(null);
       setErrorMsg('Could not read the selected file.');
     };
     reader.readAsText(file);
@@ -124,7 +159,7 @@ export const ChromeImportModal: React.FC<ChromeImportModalProps> = ({
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-md animate-fadeIn"
-      onClick={onClose}
+      onClick={handleCloseModal}
     >
       <div
         className="glass-elevated rounded-2xl w-full max-w-lg border border-white/15 shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
@@ -148,9 +183,10 @@ export const ChromeImportModal: React.FC<ChromeImportModalProps> = ({
 
           <button
             type="button"
-            onClick={onClose}
+            disabled={isImporting}
+            onClick={handleCloseModal}
             aria-label="Close modal"
-            className="w-8 h-8 rounded-lg bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white flex items-center justify-center transition-colors cursor-pointer shrink-0"
+            className="w-8 h-8 rounded-lg bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white flex items-center justify-center transition-colors cursor-pointer shrink-0 disabled:opacity-40"
           >
             <X className="w-4 h-4" />
           </button>
@@ -293,40 +329,52 @@ export const ChromeImportModal: React.FC<ChromeImportModalProps> = ({
             className="hidden"
           />
 
-          {/* File Dropzone */}
-          <div
-            onDragOver={(e) => {
-              e.preventDefault();
-              setIsDraggingFile(true);
-            }}
-            onDragLeave={() => setIsDraggingFile(false)}
-            onDrop={(e) => {
-              e.preventDefault();
-              setIsDraggingFile(false);
-              const file = e.dataTransfer.files?.[0];
-              if (file) handleFilePicked(file);
-            }}
-            onClick={() => fileInputRef.current?.click()}
-            className={`p-6 rounded-2xl border-2 border-dashed text-center transition-all cursor-pointer flex flex-col items-center justify-center gap-2.5 ${
-              isDraggingFile
-                ? 'accent-subtle-bg accent-border scale-101'
-                : 'bg-slate-950/60 border-white/15 hover:border-[var(--accent-primary)] hover:bg-slate-950/80'
-            }`}
-          >
-            <div className="w-11 h-11 rounded-2xl accent-subtle-bg flex items-center justify-center accent-text">
-              <Upload className="w-5 h-5" />
+          {/* File Dropzone or Live Animated Progress / Finish Card */}
+          {importProgress ? (
+            <ImportProgressPanel
+              progress={importProgress}
+              onDone={handleCloseModal}
+              onReset={() => {
+                setImportProgress(null);
+                setStatusMsg('');
+                setErrorMsg('');
+              }}
+            />
+          ) : (
+            <div
+              onDragOver={(e) => {
+                e.preventDefault();
+                setIsDraggingFile(true);
+              }}
+              onDragLeave={() => setIsDraggingFile(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setIsDraggingFile(false);
+                const file = e.dataTransfer.files?.[0];
+                if (file) handleFilePicked(file);
+              }}
+              onClick={() => fileInputRef.current?.click()}
+              className={`p-6 rounded-2xl border-2 border-dashed text-center transition-all cursor-pointer flex flex-col items-center justify-center gap-2.5 ${
+                isDraggingFile
+                  ? 'accent-subtle-bg accent-border scale-101'
+                  : 'bg-slate-950/60 border-white/15 hover:border-[var(--accent-primary)] hover:bg-slate-950/80'
+              }`}
+            >
+              <div className="w-11 h-11 rounded-2xl accent-subtle-bg flex items-center justify-center accent-text">
+                <Upload className="w-5 h-5" />
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-slate-100">
+                  {isImporting
+                    ? 'Auto-Importing Chrome Bookmarks...'
+                    : 'Or drop / select any Bookmark file to Auto-Import'}
+                </p>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Directly adds new links from Chrome&apos;s <span className="font-mono text-slate-200">Bookmarks</span> file or <span className="font-mono text-slate-200">bookmarks.html</span>
+                </p>
+              </div>
             </div>
-            <div>
-              <p className="text-sm font-semibold text-slate-100">
-                {isImporting
-                  ? 'Auto-Importing Chrome Bookmarks...'
-                  : 'Or drop / select any Bookmark file to Auto-Import'}
-              </p>
-              <p className="text-xs text-slate-400 mt-0.5">
-                Directly adds new links from Chrome&apos;s <span className="font-mono text-slate-200">Bookmarks</span> file or <span className="font-mono text-slate-200">bookmarks.html</span>
-              </p>
-            </div>
-          </div>
+          )}
 
           {/* Merge vs Replace Option */}
           <div className="flex items-center justify-between gap-3 pt-1 text-xs text-slate-300">

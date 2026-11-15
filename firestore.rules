@@ -69,13 +69,13 @@ service cloud.firestore {
     }
 
     function isValidBookmarkCategoryRefs(categoryId, subcategoryId) {
-      return exists(/databases/$(database)/documents/categories/$(categoryId))
-        && get(/databases/$(database)/documents/categories/$(categoryId)).data.ownerId == request.auth.uid
+      return existsAfter(/databases/$(database)/documents/categories/$(categoryId))
+        && getAfter(/databases/$(database)/documents/categories/$(categoryId)).data.ownerId == request.auth.uid
         && (
           subcategoryId == '' || (
-            exists(/databases/$(database)/documents/categories/$(subcategoryId))
-            && get(/databases/$(database)/documents/categories/$(subcategoryId)).data.ownerId == request.auth.uid
-            && get(/databases/$(database)/documents/categories/$(subcategoryId)).data.parentId == categoryId
+            existsAfter(/databases/$(database)/documents/categories/$(subcategoryId))
+            && getAfter(/databases/$(database)/documents/categories/$(subcategoryId)).data.ownerId == request.auth.uid
+            && getAfter(/databases/$(database)/documents/categories/$(subcategoryId)).data.parentId == categoryId
           )
         );
     }
@@ -218,7 +218,12 @@ service cloud.firestore {
           ) ||
           // Action 2: Toggle Favorite status
           (incoming().diff(existing()).affectedKeys().hasOnly(['isFavorite', 'updatedAt'])) ||
-          // Action 3: Edit website metadata (title, url, description, category, subcategory, favorite)
+          // Action 3: Batch Edit (Category/Subcategory + Favorite status together)
+          (
+            incoming().diff(existing()).affectedKeys().hasOnly(['categoryId', 'subcategoryId', 'isFavorite', 'updatedAt'])
+            && isValidBookmarkCategoryRefs(incoming().categoryId, incoming().subcategoryId)
+          ) ||
+          // Action 4: Edit website metadata (title, url, description, category, subcategory, favorite)
           (
             incoming().diff(existing()).affectedKeys().hasOnly(['title', 'url', 'description', 'categoryId', 'subcategoryId', 'isFavorite', 'updatedAt'])
             && isValidBookmarkCategoryRefs(incoming().categoryId, incoming().subcategoryId)
@@ -233,7 +238,7 @@ service cloud.firestore {
 
     // Collection 3: User Theme & Glass Settings
     match /userSettings/{userId} {
-      allow get: if isVerifiedUser() && isValidId(userId) && userId == request.auth.uid && existing().ownerId == request.auth.uid;
+      allow get: if isVerifiedUser() && isValidId(userId) && userId == request.auth.uid && (resource == null || existing().ownerId == request.auth.uid);
       allow list: if false;
 
       allow create: if isVerifiedUser()

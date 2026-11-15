@@ -26,7 +26,14 @@ import {
   Zap,
 } from 'lucide-react';
 import { User } from 'firebase/auth';
-import { CardDensity, GlassIntensity, THEME_PRESETS, ThemeMode, UserSettings } from '../types';
+import {
+  CardDensity,
+  GlassIntensity,
+  ImportProgressState,
+  THEME_PRESETS,
+  ThemeMode,
+  UserSettings,
+} from '../types';
 import { resolveThemeColors } from '../utils/theme';
 import {
   ChromeImportPlan,
@@ -37,6 +44,7 @@ import {
   generateBookmarkletHref,
   isFileSystemAccessSupported,
 } from '../utils/chromeLiveSync';
+import { ImportProgressPanel } from './ImportProgressPanel';
 
 interface SettingsPageProps {
   onBackToDirectory: () => void;
@@ -50,7 +58,8 @@ interface SettingsPageProps {
   existingBookmarkCount: number;
   onImportExactPlan: (
     plan: ChromeImportPlan,
-    replaceAllExisting: boolean
+    replaceAllExisting: boolean,
+    onProgress?: (progress: ImportProgressState) => void
   ) => Promise<void>;
   onClearEntireWorkspace: () => Promise<void>;
   defaultTab?: 'appearance' | 'sync' | 'account';
@@ -105,6 +114,7 @@ export const SettingsModal: React.FC<SettingsPageProps> = ({
   const [autoSyncImmediately, setAutoSyncImmediately] = useState(true);
   const [importPlan, setImportPlan] = useState<ChromeImportPlan | null>(null);
   const [isImporting, setIsImporting] = useState(false);
+  const [importProgress, setImportProgress] = useState<ImportProgressState | null>(null);
   const [isRefreshingLive, setIsRefreshingLive] = useState(false);
   const [syncStatus, setSyncStatus] = useState<string>('');
   const [syncError, setSyncError] = useState<string>('');
@@ -159,23 +169,34 @@ export const SettingsModal: React.FC<SettingsPageProps> = ({
     setSyncStatus('');
     const plan = parseChromeBookmarksExactArrangement(content);
     if (plan.bookmarks.length === 0 && plan.categories.length === 0) {
+      setImportProgress(null);
       setSyncError(
         'No bookmarks or folders were found. Please select your Chrome "Bookmarks" file or an exported bookmarks HTML file.'
       );
       return;
     }
 
-    const rootCount = plan.categories.filter((c) => c.parentTempId === '').length;
+    const totalUnits = Math.max(1, plan.categories.length + plan.bookmarks.length);
     setIsImporting(true);
-    setSyncStatus(
-      `Auto-importing and adding ${plan.bookmarks.length} bookmarks across ${rootCount} categories${
-        sourceLabel ? ` from "${sourceLabel}"` : ''
-      }...`
-    );
+    setImportProgress({
+      phase: 'categories',
+      processed: 0,
+      total: totalUnits,
+      addedBookmarks: 0,
+      addedCategories: 0,
+      skippedDuplicates: 0,
+      currentTitle: 'Preparing your links...',
+      sourceLabel,
+    });
     try {
-      await onImportExactPlan(plan, replaceAllExisting);
-      onBackToDirectory();
+      await onImportExactPlan(plan, replaceAllExisting, (progress) => {
+        setImportProgress({
+          ...progress,
+          sourceLabel,
+        });
+      });
     } catch (err) {
+      setImportProgress(null);
       setSyncError(
         err instanceof Error ? err.message : 'Failed to import Chrome bookmarks.'
       );
@@ -185,12 +206,25 @@ export const SettingsModal: React.FC<SettingsPageProps> = ({
   };
 
   const handleFilePicked = (file: File) => {
+    setSyncError('');
+    setSyncStatus('');
+    setImportProgress({
+      phase: 'reading',
+      processed: 0,
+      total: 1,
+      addedBookmarks: 0,
+      addedCategories: 0,
+      skippedDuplicates: 0,
+      currentTitle: `Reading ${file.name}...`,
+      sourceLabel: file.name,
+    });
     const reader = new FileReader();
     reader.onload = (e) => {
       const text = typeof e.target?.result === 'string' ? e.target.result : '';
       handleProcessContent(text, file.name);
     };
     reader.onerror = () => {
+      setImportProgress(null);
       setSyncError('Could not read the selected file.');
     };
     reader.readAsText(file);
@@ -577,163 +611,127 @@ export const SettingsModal: React.FC<SettingsPageProps> = ({
             </div>
           )}
 
-          {/* METHOD 1: 1-CLICK LIVE CHROME PROFILE LINK (NO RE-UPLOAD REQUIRED) */}
+          {/* METHOD 1: FILE UPLOAD OR PASTE (PRIMARY) */}
           <section className="glass-surface rounded-2xl p-5 sm:p-6 space-y-4 border accent-border">
-            <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
-              <div className="space-y-1">
-                <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md accent-subtle-bg accent-text text-[11px] font-semibold">
-                  <Zap className="w-3 h-3" />
-                  <span>Method 1 · Zero Re-Upload</span>
-                </div>
-                <h2 className="text-sm sm:text-base font-semibold text-slate-100 flex items-center gap-2">
-                  <Link2 className="w-4 h-4 accent-text" />
-                  <span>Live Chrome Profile Link (1-Click Refresh &amp; Auto-Watch)</span>
-                </h2>
-                <p className="text-xs text-slate-400 leading-relaxed">
-                  Click <strong className="text-slate-200">Sync from Windows</strong> or <strong className="text-slate-200">Sync from macOS</strong> below to automatically use your system&apos;s default Chrome <span className="font-mono text-slate-200">Bookmarks</span> path and start syncing immediately without selecting a file path.
-                </p>
+            <div className="space-y-1">
+              <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md accent-subtle-bg accent-text text-[11px] font-semibold">
+                <Upload className="w-3 h-3" />
+                <span>Method 1 · File Upload or Paste</span>
               </div>
-
-              {linkedChromeFileName && (
-                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-xs font-semibold shrink-0 max-w-xs truncate">
-                  <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                  <span className="truncate">Active: {linkedChromeFileName}</span>
-                </span>
-              )}
+              <h2 className="text-sm sm:text-base font-semibold text-slate-100 flex items-center gap-2">
+                <Upload className="w-4 h-4 accent-text" />
+                <span>Upload Chrome Bookmarks File or Paste</span>
+              </h2>
+              <p className="text-xs text-slate-400 leading-relaxed">
+                Drop an exported <span className="font-mono text-slate-300">bookmarks.html</span> or Chrome <span className="font-mono text-slate-300">Bookmarks</span> JSON file here anytime. By default, MyFav merges only new websites without duplicating existing ones.
+              </p>
             </div>
 
-            {/* Direct 1-Click OS Sync Buttons (Automatic Path - No File Picker Needed) */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <button
-                type="button"
-                disabled={syncingOs !== null}
-                onClick={() => handleSyncFromOs('win')}
-                className="w-full min-h-[48px] px-4 py-2.5 rounded-xl accent-subtle-bg hover:bg-white/10 border accent-border accent-text text-xs font-semibold flex items-center justify-between gap-3 transition-colors cursor-pointer disabled:opacity-60"
+            {/* Hidden File Input */}
+            <input
+              type="file"
+              ref={fileInputRef}
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) handleFilePicked(file);
+                e.target.value = '';
+              }}
+              accept=".html,.htm,.json,*"
+              className="hidden"
+            />
+
+            {/* Dropzone or Animated Import Progress & Finish Interaction */}
+            {importProgress ? (
+              <ImportProgressPanel
+                progress={importProgress}
+                onDone={() => {
+                  setImportProgress(null);
+                  onBackToDirectory();
+                }}
+                onReset={() => {
+                  setImportProgress(null);
+                  setSyncStatus('');
+                  setSyncError('');
+                }}
+              />
+            ) : (
+              <div
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setIsDraggingFile(true);
+                }}
+                onDragLeave={() => setIsDraggingFile(false)}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  setIsDraggingFile(false);
+                  const file = e.dataTransfer.files?.[0];
+                  if (file) handleFilePicked(file);
+                }}
+                onClick={() => fileInputRef.current?.click()}
+                className={`p-5 sm:p-6 rounded-2xl border-2 border-dashed text-center transition-all cursor-pointer flex flex-col items-center justify-center gap-2.5 ${
+                  isDraggingFile
+                    ? 'accent-subtle-bg accent-border scale-101'
+                    : 'bg-slate-950/60 border-white/10 hover:border-white/25 hover:bg-slate-950/80'
+                }`}
               >
-                <div className="flex items-center gap-2.5 min-w-0 text-left">
-                  <RefreshCw
-                    className={`w-4 h-4 shrink-0 ${syncingOs === 'win' ? 'animate-spin' : ''}`}
-                  />
-                  <div className="min-w-0">
-                    <span className="block font-semibold">
-                      {syncingOs === 'win' ? 'Syncing from Windows...' : 'Sync from Windows'}
-                    </span>
-                    <span className="block text-[10px] font-mono opacity-75 truncate">
-                      {WIN_CHROME_PATH}
-                    </span>
-                  </div>
+                <div className="w-10 h-10 rounded-full accent-subtle-bg flex items-center justify-center accent-text">
+                  <Upload className="w-5 h-5" />
                 </div>
-                {copiedPath === 'win' && syncingOs !== 'win' ? (
-                  <span className="px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 text-[10px] font-bold shrink-0">
-                    Synced
-                  </span>
-                ) : (
-                  <Chrome className="w-4 h-4 shrink-0" />
-                )}
-              </button>
-
-              <button
-                type="button"
-                disabled={syncingOs !== null}
-                onClick={() => handleSyncFromOs('mac')}
-                className="w-full min-h-[48px] px-4 py-2.5 rounded-xl accent-subtle-bg hover:bg-white/10 border accent-border accent-text text-xs font-semibold flex items-center justify-between gap-3 transition-colors cursor-pointer disabled:opacity-60"
-              >
-                <div className="flex items-center gap-2.5 min-w-0 text-left">
-                  <RefreshCw
-                    className={`w-4 h-4 shrink-0 ${syncingOs === 'mac' ? 'animate-spin' : ''}`}
-                  />
-                  <div className="min-w-0">
-                    <span className="block font-semibold">
-                      {syncingOs === 'mac' ? 'Syncing from macOS...' : 'Sync from macOS'}
-                    </span>
-                    <span className="block text-[10px] font-mono opacity-75 truncate">
-                      {MAC_CHROME_PATH}
-                    </span>
-                  </div>
+                <div>
+                  <p className="text-xs sm:text-sm font-semibold text-slate-100">
+                    Click to browse or drop a Chrome Bookmarks file here
+                  </p>
+                  <p className="text-[11px] text-slate-400 mt-0.5">
+                    Smart merge adds only new folders &amp; websites unless &ldquo;Replace existing&rdquo; is checked below
+                  </p>
                 </div>
-                {copiedPath === 'mac' && syncingOs !== 'mac' ? (
-                  <span className="px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 text-[10px] font-bold shrink-0">
-                    Synced
-                  </span>
-                ) : (
-                  <Chrome className="w-4 h-4 shrink-0" />
-                )}
-              </button>
-            </div>
-
-            {linkedChromeFileName && (
-              <div className="p-4 rounded-xl bg-slate-950/70 border border-white/10 space-y-3">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <p className="text-xs font-semibold text-slate-100 truncate">
-                      Auto-Sync Path: <span className="font-mono accent-text">{linkedChromeFileName}</span>
-                    </p>
-                    <p className="text-[11px] text-slate-400 mt-0.5">
-                      {lastChromeSyncTime
-                        ? `Last synced at ${lastChromeSyncTime}`
-                        : 'Ready for automatic incremental sync'}
-                    </p>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2">
-                    <button
-                      type="button"
-                      disabled={isRefreshingLive}
-                      onClick={async () => {
-                        if (!onRefreshLiveChromeFile) return;
-                        setIsRefreshingLive(true);
-                        setSyncError('');
-                        setSyncStatus('');
-                        try {
-                          await onRefreshLiveChromeFile();
-                          setSyncStatus('Synced latest bookmarks directly from your Chrome profile!');
-                        } catch (err) {
-                          setSyncError(
-                            err instanceof Error
-                              ? err.message
-                              : 'Could not refresh Chrome profile.'
-                          );
-                        } finally {
-                          setIsRefreshingLive(false);
-                        }
-                      }}
-                      className="min-h-[40px] px-4 py-2 rounded-xl accent-subtle-bg hover:bg-white/10 border accent-border accent-text text-xs font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer disabled:opacity-50"
-                    >
-                      <RefreshCw className={`w-4 h-4 ${isRefreshingLive ? 'animate-spin' : ''}`} />
-                      <span>{isRefreshingLive ? 'Syncing...' : 'Refresh Now'}</span>
-                    </button>
-
-                    {onUnlinkLiveChromeFile && (
-                      <button
-                        type="button"
-                        onClick={onUnlinkLiveChromeFile}
-                        title="Unlink path"
-                        className="min-h-[40px] px-4 py-2 rounded-xl accent-subtle-bg hover:bg-white/10 border accent-border accent-text text-xs font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer"
-                      >
-                        <Unlink className="w-4 h-4" />
-                        <span>Unlink</span>
-                      </button>
-                    )}
-                  </div>
-                </div>
-
-                {onToggleAutoWatchChromeFile && (
-                  <div className="pt-2.5 border-t border-white/8 flex items-center justify-between gap-3">
-                    <label className="flex items-center gap-2 text-xs text-slate-200 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={autoWatchChromeFile}
-                        onChange={(e) => onToggleAutoWatchChromeFile(e.target.checked)}
-                        className="rounded border-white/20 bg-slate-900 accent-[var(--accent-primary)]"
-                      />
-                      <span>
-                        <strong>Auto-Watch Live Profile:</strong> Automatically check and import new Chrome bookmarks every 10 seconds while MyFav is open
-                      </span>
-                    </label>
-                  </div>
-                )}
               </div>
             )}
+
+            {/* Import Options */}
+            <div className="pt-1 flex items-center justify-between gap-3 text-xs text-slate-300">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={replaceAllExisting}
+                  onChange={(e) => setReplaceAllExisting(e.target.checked)}
+                  className="rounded border-white/20 bg-slate-900 accent-[var(--accent-primary)]"
+                />
+                <span>Replace existing bookmarks (leave unchecked to automatically add new links)</span>
+              </label>
+            </div>
+
+            {/* Manual Paste Alternative */}
+            <div className="pt-2 border-t border-white/8">
+              <button
+                type="button"
+                onClick={() => setShowPasteBox((prev) => !prev)}
+                className="px-3 py-1.5 rounded-lg text-xs text-slate-400 hover:text-white hover:bg-white/5 flex items-center gap-1.5 transition-all cursor-pointer"
+              >
+                <FileText className="w-3.5 h-3.5 accent-text" />
+                <span>{showPasteBox ? 'Hide manual paste' : 'Or paste bookmarks content manually'}</span>
+              </button>
+
+              {showPasteBox && (
+                <div className="mt-3 space-y-2.5">
+                  <textarea
+                    rows={4}
+                    value={pasteContent}
+                    onChange={(e) => setPasteContent(e.target.value)}
+                    placeholder="Paste Chrome JSON or HTML bookmarks code here..."
+                    className="w-full p-3 rounded-xl bg-slate-950 border border-white/10 text-xs text-slate-200 font-mono placeholder:text-slate-600 focus:outline-none focus:border-[var(--accent-primary)]"
+                  />
+                  <button
+                    type="button"
+                    disabled={!pasteContent.trim() || isImporting}
+                    onClick={() => handleProcessContent(pasteContent, 'Manual Paste')}
+                    className="chrome-sync-btn w-full min-h-[40px] px-4 py-2 rounded-xl accent-subtle-bg border accent-border accent-text text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer disabled:opacity-40"
+                  >
+                    {isImporting ? 'Importing...' : 'Auto-Import Pasted Content'}
+                  </button>
+                </div>
+              )}
+            </div>
           </section>
 
           {/* METHOD 2 & 3: COMPANION EXTENSION + 1-CLICK BOOKMARKLET */}
@@ -766,7 +764,7 @@ export const SettingsModal: React.FC<SettingsPageProps> = ({
                     'Downloaded "myfav-chrome-sync-extension.zip"! Unzip it and load it in chrome://extensions for automatic real-time sync.'
                   );
                 }}
-                className="w-full min-h-[40px] px-4 py-2 rounded-xl accent-subtle-bg hover:bg-white/10 border accent-border accent-text text-xs font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                className="chrome-sync-btn w-full min-h-[40px] px-4 py-2 rounded-xl accent-subtle-bg border accent-border accent-text text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer"
               >
                 <Download className="w-4 h-4" />
                 <span>Download Chrome Extension (.zip)</span>
@@ -801,7 +799,7 @@ export const SettingsModal: React.FC<SettingsPageProps> = ({
                       );
                     }}
                     title="Drag me to your Chrome Bookmarks Bar!"
-                    className="min-h-[40px] px-4 py-2 rounded-xl accent-subtle-bg hover:bg-white/10 border accent-border accent-text text-xs font-semibold flex items-center justify-center gap-2 transition-colors cursor-grab active:cursor-grabbing shrink-0"
+                    className="chrome-sync-btn min-h-[40px] px-4 py-2 rounded-xl accent-subtle-bg border accent-border accent-text text-xs font-semibold flex items-center justify-center gap-2 cursor-grab active:cursor-grabbing shrink-0"
                   >
                     <BookmarkPlus className="w-4 h-4" />
                     <span>+ Save to MyFav</span>
@@ -811,108 +809,165 @@ export const SettingsModal: React.FC<SettingsPageProps> = ({
             </section>
           </div>
 
-          {/* MANUAL FILE DROPZONE OR PASTE FALLBACK */}
-          <section className="glass-surface rounded-2xl p-5 sm:p-6 space-y-4">
-            <div>
-              <h2 className="text-sm sm:text-base font-semibold text-slate-100 flex items-center gap-2">
-                <Upload className="w-4 h-4 accent-text" />
-                <span>One-Time File Import or Paste</span>
-              </h2>
-              <p className="text-xs text-slate-400 mt-0.5 leading-relaxed">
-                You can also drop an exported <span className="font-mono text-slate-300">bookmarks.html</span> or <span className="font-mono text-slate-300">Bookmarks</span> JSON file here anytime. By default, MyFav merges only new websites without duplicating existing ones.
-              </p>
-            </div>
+          {/* HIDDEN FOR NOW: 1-CLICK LIVE CHROME PROFILE LINK (ZERO RE-UPLOAD) */}
+          {false && (
+            <section className="glass-surface rounded-2xl p-5 sm:p-6 space-y-4 border accent-border">
+              <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+                <div className="space-y-1">
+                  <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md accent-subtle-bg accent-text text-[11px] font-semibold">
+                    <Zap className="w-3 h-3" />
+                    <span>Zero Re-Upload</span>
+                  </div>
+                  <h2 className="text-sm sm:text-base font-semibold text-slate-100 flex items-center gap-2">
+                    <Link2 className="w-4 h-4 accent-text" />
+                    <span>Live Chrome Profile Link (1-Click Refresh &amp; Auto-Watch)</span>
+                  </h2>
+                  <p className="text-xs text-slate-400 leading-relaxed">
+                    Click <strong className="text-slate-200">Sync from Windows</strong> or <strong className="text-slate-200">Sync from macOS</strong> below to automatically use your system&apos;s default Chrome <span className="font-mono text-slate-200">Bookmarks</span> path and start syncing immediately without selecting a file path.
+                  </p>
+                </div>
 
-            {/* Hidden File Input */}
-            <input
-              type="file"
-              ref={fileInputRef}
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (file) handleFilePicked(file);
-              }}
-              accept=".html,.htm,.json,*"
-              className="hidden"
-            />
-
-            {/* Dropzone */}
-            <div
-              onDragOver={(e) => {
-                e.preventDefault();
-                setIsDraggingFile(true);
-              }}
-              onDragLeave={() => setIsDraggingFile(false)}
-              onDrop={(e) => {
-                e.preventDefault();
-                setIsDraggingFile(false);
-                const file = e.dataTransfer.files?.[0];
-                if (file) handleFilePicked(file);
-              }}
-              onClick={() => fileInputRef.current?.click()}
-              className={`p-5 sm:p-6 rounded-2xl border-2 border-dashed text-center transition-all cursor-pointer flex flex-col items-center justify-center gap-2.5 ${
-                isDraggingFile
-                  ? 'accent-subtle-bg accent-border scale-101'
-                  : 'bg-slate-950/60 border-white/10 hover:border-white/25 hover:bg-slate-950/80'
-              }`}
-            >
-              <div className="w-10 h-10 rounded-xl accent-subtle-bg flex items-center justify-center accent-text">
-                <Upload className="w-5 h-5" />
+                {linkedChromeFileName && (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-xs font-semibold shrink-0 max-w-xs truncate">
+                    <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                    <span className="truncate">Active: {linkedChromeFileName}</span>
+                  </span>
+                )}
               </div>
-              <div>
-                <p className="text-xs sm:text-sm font-semibold text-slate-100">
-                  Click to browse or drop a Chrome Bookmarks file here
-                </p>
-                <p className="text-[11px] text-slate-400 mt-0.5">
-                  Smart merge adds only new folders &amp; websites unless &ldquo;Replace existing&rdquo; is checked below
-                </p>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <button
+                  type="button"
+                  disabled={syncingOs !== null}
+                  onClick={() => handleSyncFromOs('win')}
+                  className="chrome-sync-btn w-full min-h-[48px] px-4 py-2.5 rounded-xl accent-subtle-bg border accent-border accent-text text-xs font-semibold flex items-center justify-between gap-3 cursor-pointer disabled:opacity-60"
+                >
+                  <div className="flex items-center gap-2.5 min-w-0 text-left">
+                    <RefreshCw
+                      className={`w-4 h-4 shrink-0 ${syncingOs === 'win' ? 'animate-spin' : ''}`}
+                    />
+                    <div className="min-w-0">
+                      <span className="block font-semibold">
+                        {syncingOs === 'win' ? 'Syncing from Windows...' : 'Sync from Windows'}
+                      </span>
+                      <span className="block text-[10px] font-mono opacity-75 truncate">
+                        {WIN_CHROME_PATH}
+                      </span>
+                    </div>
+                  </div>
+                  {copiedPath === 'win' && syncingOs !== 'win' ? (
+                    <span className="px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 text-[10px] font-bold shrink-0">
+                      Synced
+                    </span>
+                  ) : (
+                    <Chrome className="w-4 h-4 shrink-0" />
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  disabled={syncingOs !== null}
+                  onClick={() => handleSyncFromOs('mac')}
+                  className="chrome-sync-btn w-full min-h-[48px] px-4 py-2.5 rounded-xl accent-subtle-bg border accent-border accent-text text-xs font-semibold flex items-center justify-between gap-3 cursor-pointer disabled:opacity-60"
+                >
+                  <div className="flex items-center gap-2.5 min-w-0 text-left">
+                    <RefreshCw
+                      className={`w-4 h-4 shrink-0 ${syncingOs === 'mac' ? 'animate-spin' : ''}`}
+                    />
+                    <div className="min-w-0">
+                      <span className="block font-semibold">
+                        {syncingOs === 'mac' ? 'Syncing from macOS...' : 'Sync from macOS'}
+                      </span>
+                      <span className="block text-[10px] font-mono opacity-75 truncate">
+                        {MAC_CHROME_PATH}
+                      </span>
+                    </div>
+                  </div>
+                  {copiedPath === 'mac' && syncingOs !== 'mac' ? (
+                    <span className="px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 text-[10px] font-bold shrink-0">
+                      Synced
+                    </span>
+                  ) : (
+                    <Chrome className="w-4 h-4 shrink-0" />
+                  )}
+                </button>
               </div>
-            </div>
 
-            {/* Import Options */}
-            <div className="pt-1 flex items-center justify-between gap-3 text-xs text-slate-300">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={replaceAllExisting}
-                  onChange={(e) => setReplaceAllExisting(e.target.checked)}
-                  className="rounded border-white/20 bg-slate-900 accent-[var(--accent-primary)]"
-                />
-                <span>Replace existing bookmarks (leave unchecked to automatically add new links)</span>
-              </label>
-            </div>
+              {linkedChromeFileName && (
+                <div className="p-4 rounded-xl bg-slate-950/70 border border-white/10 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold text-slate-100 truncate">
+                        Auto-Sync Path: <span className="font-mono accent-text">{linkedChromeFileName}</span>
+                      </p>
+                      <p className="text-[11px] text-slate-400 mt-0.5">
+                        {lastChromeSyncTime
+                          ? `Last synced at ${lastChromeSyncTime}`
+                          : 'Ready for automatic incremental sync'}
+                      </p>
+                    </div>
 
-            {/* Manual Paste Alternative */}
-            <div className="pt-2 border-t border-white/8">
-              <button
-                type="button"
-                onClick={() => setShowPasteBox((prev) => !prev)}
-                className="text-xs text-slate-400 hover:text-white flex items-center gap-1.5 transition-colors cursor-pointer"
-              >
-                <FileText className="w-3.5 h-3.5" />
-                <span>{showPasteBox ? 'Hide manual paste' : 'Or paste bookmarks content manually'}</span>
-              </button>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={isRefreshingLive}
+                        onClick={async () => {
+                          if (!onRefreshLiveChromeFile) return;
+                          setIsRefreshingLive(true);
+                          setSyncError('');
+                          setSyncStatus('');
+                          try {
+                            await onRefreshLiveChromeFile();
+                            setSyncStatus('Synced latest bookmarks directly from your Chrome profile!');
+                          } catch (err) {
+                            setSyncError(
+                              err instanceof Error
+                                ? err.message
+                                : 'Could not refresh Chrome profile.'
+                            );
+                          } finally {
+                            setIsRefreshingLive(false);
+                          }
+                        }}
+                        className="chrome-sync-btn min-h-[40px] px-4 py-2 rounded-xl accent-subtle-bg border accent-border accent-text text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                      >
+                        <RefreshCw className={`w-4 h-4 ${isRefreshingLive ? 'animate-spin' : ''}`} />
+                        <span>{isRefreshingLive ? 'Syncing...' : 'Refresh Now'}</span>
+                      </button>
 
-              {showPasteBox && (
-                <div className="mt-3 space-y-2.5">
-                  <textarea
-                    rows={4}
-                    value={pasteContent}
-                    onChange={(e) => setPasteContent(e.target.value)}
-                    placeholder="Paste Chrome JSON or HTML bookmarks code here..."
-                    className="w-full p-3 rounded-xl bg-slate-950 border border-white/10 text-xs text-slate-200 font-mono placeholder:text-slate-600 focus:outline-none focus:border-[var(--accent-primary)]"
-                  />
-                  <button
-                    type="button"
-                    disabled={!pasteContent.trim() || isImporting}
-                    onClick={() => handleProcessContent(pasteContent, 'Manual Paste')}
-                    className="w-full min-h-[40px] px-4 py-2 rounded-xl accent-subtle-bg hover:bg-white/10 border accent-border accent-text text-xs font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer disabled:opacity-40"
-                  >
-                    {isImporting ? 'Importing...' : 'Auto-Import Pasted Content'}
-                  </button>
+                      {onUnlinkLiveChromeFile && (
+                        <button
+                          type="button"
+                          onClick={onUnlinkLiveChromeFile}
+                          title="Unlink path"
+                          className="chrome-sync-btn min-h-[40px] px-4 py-2 rounded-xl accent-subtle-bg border accent-border accent-text text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer"
+                        >
+                          <Unlink className="w-4 h-4" />
+                          <span>Unlink</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {onToggleAutoWatchChromeFile && (
+                    <div className="pt-2.5 border-t border-white/8 flex items-center justify-between gap-3">
+                      <label className="flex items-center gap-2 text-xs text-slate-200 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={autoWatchChromeFile}
+                          onChange={(e) => onToggleAutoWatchChromeFile?.(e.target.checked)}
+                          className="rounded border-white/20 bg-slate-900 accent-[var(--accent-primary)]"
+                        />
+                        <span>
+                          <strong>Auto-Watch Live Profile:</strong> Automatically check and import new Chrome bookmarks every 10 seconds while MyFav is open
+                        </span>
+                      </label>
+                    </div>
+                  )}
                 </div>
               )}
-            </div>
-          </section>
+            </section>
+          )}
         </div>
       )}
 

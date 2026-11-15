@@ -18,7 +18,9 @@ import {
   ChromeImportPlan,
   parseChromeBookmarksExactArrangement,
 } from '../utils/chromeBookmarksParser';
+import { ImportProgressState } from '../types';
 import { CategoryIcon, WebsiteFavicon } from './CategoryIcon';
+import { ImportProgressPanel } from './ImportProgressPanel';
 
 interface ChromeSyncPageProps {
   onBackToDirectory: () => void;
@@ -28,7 +30,8 @@ interface ChromeSyncPageProps {
   existingBookmarkCount: number;
   onImportExactPlan: (
     plan: ChromeImportPlan,
-    replaceAllExisting: boolean
+    replaceAllExisting: boolean,
+    onProgress?: (progress: ImportProgressState) => void
   ) => Promise<void>;
   onClearEntireWorkspace: () => Promise<void>;
 }
@@ -52,6 +55,7 @@ export const ChromeSyncPage: React.FC<ChromeSyncPageProps> = ({
   const [replaceAllExisting, setReplaceAllExisting] = useState(true);
   const [autoSyncImmediately, setAutoSyncImmediately] = useState(true);
   const [isImporting, setIsImporting] = useState(false);
+  const [importProgress, setImportProgress] = useState<ImportProgressState | null>(null);
   const [isClearing, setIsClearing] = useState(false);
   const [copiedPath, setCopiedPath] = useState<'win' | 'mac' | null>(null);
   const [statusMessage, setStatusMessage] = useState('');
@@ -75,6 +79,7 @@ export const ChromeSyncPage: React.FC<ChromeSyncPageProps> = ({
     setStatusMessage('');
     const plan = parseChromeBookmarksExactArrangement(content);
     if (plan.bookmarks.length === 0 && plan.categories.length === 0) {
+      setImportProgress(null);
       setError(
         'No bookmarks or folders were found in that file. Make sure you selected your Chrome Bookmarks file or exported HTML file.'
       );
@@ -85,15 +90,28 @@ export const ChromeSyncPage: React.FC<ChromeSyncPageProps> = ({
     const subCount = plan.categories.filter((c) => c.parentTempId !== '').length;
 
     if (shouldAutoCommit) {
+      const totalUnits = Math.max(1, plan.categories.length + plan.bookmarks.length);
       setIsImporting(true);
-      setStatusMessage(
-        `Auto-syncing ${plan.bookmarks.length} Chrome bookmarks and ${rootCount} categories to your account...`
-      );
+      setImportProgress({
+        phase: 'categories',
+        processed: 0,
+        total: totalUnits,
+        addedBookmarks: 0,
+        addedCategories: 0,
+        skippedDuplicates: 0,
+        currentTitle: 'Preparing your links...',
+        sourceLabel,
+      });
       try {
-        await onImportExactPlan(plan, replaceAllExisting);
-        onBackToDirectory();
+        await onImportExactPlan(plan, replaceAllExisting, (progress) => {
+          setImportProgress({
+            ...progress,
+            sourceLabel,
+          });
+        });
         return;
       } catch (err) {
+        setImportProgress(null);
         setError(
           err instanceof Error ? err.message : 'Failed to auto-sync Chrome bookmarks.'
         );
@@ -102,6 +120,7 @@ export const ChromeSyncPage: React.FC<ChromeSyncPageProps> = ({
       }
     }
 
+    setImportProgress(null);
     setImportPlan(plan);
     setStatusMessage(
       `Found ${plan.bookmarks.length} bookmarks across ${rootCount} categories and ${subCount} subcategories${
@@ -111,12 +130,27 @@ export const ChromeSyncPage: React.FC<ChromeSyncPageProps> = ({
   };
 
   const handleFileUpload = (file: File) => {
+    setError('');
+    setStatusMessage('');
+    if (autoSyncImmediately) {
+      setImportProgress({
+        phase: 'reading',
+        processed: 0,
+        total: 1,
+        addedBookmarks: 0,
+        addedCategories: 0,
+        skippedDuplicates: 0,
+        currentTitle: `Reading ${file.name}...`,
+        sourceLabel: file.name,
+      });
+    }
     const reader = new FileReader();
     reader.onload = (e) => {
       const text = typeof e.target?.result === 'string' ? e.target.result : '';
       handleAnalyzeContent(text, file.name, autoSyncImmediately);
     };
     reader.onerror = () => {
+      setImportProgress(null);
       setError('Could not read the selected file.');
     };
     reader.readAsText(file);
@@ -124,12 +158,32 @@ export const ChromeSyncPage: React.FC<ChromeSyncPageProps> = ({
 
   const handleConfirmImport = async () => {
     if (!importPlan) return;
+    const totalUnits = Math.max(
+      1,
+      importPlan.categories.length + importPlan.bookmarks.length
+    );
     setIsImporting(true);
     setError('');
+    setImportProgress({
+      phase: 'categories',
+      processed: 0,
+      total: totalUnits,
+      addedBookmarks: 0,
+      addedCategories: 0,
+      skippedDuplicates: 0,
+      currentTitle: 'Preparing your links...',
+      sourceLabel: 'Chrome Arrangement Preview',
+    });
     try {
-      await onImportExactPlan(importPlan, replaceAllExisting);
-      onBackToDirectory();
+      await onImportExactPlan(importPlan, replaceAllExisting, (progress) => {
+        setImportProgress({
+          ...progress,
+          sourceLabel: 'Chrome Arrangement Preview',
+        });
+      });
+      setImportPlan(null);
     } catch (err) {
+      setImportProgress(null);
       setError(
         err instanceof Error ? err.message : 'Failed to import Chrome bookmarks.'
       );
@@ -344,49 +398,66 @@ export const ChromeSyncPage: React.FC<ChromeSyncPageProps> = ({
             <span className="font-mono-tabular text-white">.html</span> file below:
           </div>
 
-          <div
-            onDragOver={(e) => {
-              e.preventDefault();
-              setIsDraggingFile(true);
-            }}
-            onDragLeave={() => setIsDraggingFile(false)}
-            onDrop={(e) => {
-              e.preventDefault();
-              setIsDraggingFile(false);
-              const file = e.dataTransfer.files?.[0];
-              if (file) handleFileUpload(file);
-            }}
-            onClick={() => fileInputRef.current?.click()}
-            className={`p-8 rounded-2xl border-2 border-dashed text-center transition-all cursor-pointer space-y-3 ${
-              isDraggingFile
-                ? 'accent-subtle-bg accent-border'
-                : 'bg-slate-950/50 border-white/15 hover:border-[var(--accent-primary)] hover:bg-slate-950/80'
-            }`}
-          >
-            <input
-              ref={fileInputRef}
-              type="file"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
+          {importProgress ? (
+            <ImportProgressPanel
+              progress={importProgress}
+              onDone={() => {
+                setImportProgress(null);
+                onBackToDirectory();
+              }}
+              onReset={() => {
+                setImportProgress(null);
+                setImportPlan(null);
+                setStatusMessage('');
+                setError('');
+              }}
+            />
+          ) : (
+            <div
+              onDragOver={(e) => {
+                e.preventDefault();
+                setIsDraggingFile(true);
+              }}
+              onDragLeave={() => setIsDraggingFile(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setIsDraggingFile(false);
+                const file = e.dataTransfer.files?.[0];
                 if (file) handleFileUpload(file);
               }}
-              className="hidden"
-            />
-            <div className="w-12 h-12 rounded-2xl accent-bg text-white flex items-center justify-center mx-auto shadow-lg">
-              <Upload className="w-6 h-6" />
+              onClick={() => fileInputRef.current?.click()}
+              className={`p-8 rounded-2xl border-2 border-dashed text-center transition-all cursor-pointer space-y-3 ${
+                isDraggingFile
+                  ? 'accent-subtle-bg accent-border'
+                  : 'bg-slate-950/50 border-white/15 hover:border-[var(--accent-primary)] hover:bg-slate-950/80'
+              }`}
+            >
+              <input
+                ref={fileInputRef}
+                type="file"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) handleFileUpload(file);
+                  e.target.value = '';
+                }}
+                className="hidden"
+              />
+              <div className="w-12 h-12 rounded-2xl accent-bg text-white flex items-center justify-center mx-auto shadow-lg">
+                <Upload className="w-6 h-6" />
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-slate-100">
+                  {isImporting
+                    ? 'Syncing Chrome Categories & Bookmarks...'
+                    : 'Select Chrome Bookmarks File (or Drag & Drop Here)'}
+                </p>
+                <p className="text-xs text-slate-400 mt-1">
+                  Accepts live Chrome <span className="font-mono-tabular text-slate-200">Bookmarks</span> file or exported{' '}
+                  <span className="font-mono-tabular text-slate-200">bookmarks.html</span> — preserves exact folder & bookmark order
+                </p>
+              </div>
             </div>
-            <div>
-              <p className="text-sm font-semibold text-slate-100">
-                {isImporting
-                  ? 'Syncing Chrome Categories & Bookmarks...'
-                  : 'Select Chrome Bookmarks File (or Drag & Drop Here)'}
-              </p>
-              <p className="text-xs text-slate-400 mt-1">
-                Accepts live Chrome <span className="font-mono-tabular text-slate-200">Bookmarks</span> file or exported{' '}
-                <span className="font-mono-tabular text-slate-200">bookmarks.html</span> — preserves exact folder & bookmark order
-              </p>
-            </div>
-          </div>
+          )}
         </div>
 
         {/* Method 2: Paste Directly from Chrome Bookmark Manager */}

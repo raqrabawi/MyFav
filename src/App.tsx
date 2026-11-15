@@ -33,9 +33,9 @@ import {
   ChevronLeft,
   ArrowLeft,
   GripVertical,
-  Eye,
   Zap,
   RefreshCw,
+  StarOff,
 } from 'lucide-react';
 import {
   onAuthStateChanged,
@@ -67,6 +67,7 @@ import {
   CategoryItem,
   DEMO_BOOKMARK_IDS,
   DEMO_CATEGORY_IDS,
+  ImportProgressState,
   INITIAL_BOOKMARKS,
   INITIAL_CATEGORIES,
   QuickShortcutIconType,
@@ -99,6 +100,7 @@ import {
 } from './utils/chromeLiveSync';
 import { BookmarkModal } from './components/BookmarkModal';
 import { MoveWebsiteModal } from './components/MoveWebsiteModal';
+import { BatchEditModal, BatchEditPayload } from './components/BatchEditModal';
 import { CategoryManagerModal as CategoriesPage } from './components/CategoryManagerModal';
 import { SettingsModal as SettingsPage } from './components/SettingsModal';
 import { ChromeSyncPage } from './components/ChromeSyncPage';
@@ -239,7 +241,10 @@ export default function App() {
   // Modals State
   const [isBookmarkModalOpen, setIsBookmarkModalOpen] = useState(false);
   const [editingBookmark, setEditingBookmark] = useState<BookmarkItem | null>(null);
+  const lastSelectedIdRef = useRef<string | null>(null);
   const [bookmarksToMove, setBookmarksToMove] = useState<BookmarkItem[]>([]);
+  const [bookmarksToBatchEdit, setBookmarksToBatchEdit] = useState<BookmarkItem[]>([]);
+  const [isBatchEditing, setIsBatchEditing] = useState(false);
   const [previewingBookmark, setPreviewingBookmark] = useState<BookmarkItem | null>(null);
   const [isShortcutModalOpen, setIsShortcutModalOpen] = useState(false);
   const [editingShortcut, setEditingShortcut] = useState<QuickShortcutItem | null>(null);
@@ -470,14 +475,23 @@ export default function App() {
                 updatedAt: serverTimestamp(),
               });
             }
+            const migratedCatIds = new Set([
+              ...roots.map((r) => r.id),
+              ...subs.map((s) => s.id),
+            ]);
             for (const bm of bookmarks) {
+              if (!migratedCatIds.has(bm.categoryId)) continue;
+              const safeSubId =
+                bm.subcategoryId && migratedCatIds.has(bm.subcategoryId)
+                  ? bm.subcategoryId
+                  : '';
               await setDoc(doc(db, 'bookmarks', bm.id), {
                 ownerId: user.uid,
                 title: bm.title.slice(0, 120),
                 url: bm.url.slice(0, 500),
                 description: bm.description.slice(0, 400),
                 categoryId: bm.categoryId,
-                subcategoryId: bm.subcategoryId || '',
+                subcategoryId: safeSubId,
                 isFavorite: Boolean(bm.isFavorite),
                 createdAt: serverTimestamp(),
                 updatedAt: serverTimestamp(),
@@ -798,6 +812,13 @@ export default function App() {
           handleFirestoreError(error, OperationType.DELETE, `categories/${root.id}`);
         }
       }
+      for (const sc of sharedCategories) {
+        try {
+          await deleteDoc(doc(db, 'sharedCategories', sc.id));
+        } catch (error) {
+          handleFirestoreError(error, OperationType.DELETE, `sharedCategories/${sc.id}`);
+        }
+      }
     } else {
       setQuickShortcuts([]);
       setBookmarks([]);
@@ -818,10 +839,53 @@ export default function App() {
   // Supports both Replace All mode and Smart Incremental Merge (zero duplicates when syncing live!)
   const handleImportExactChromePlan = async (
     plan: ChromeImportPlan,
-    replaceAllExisting: boolean
+    replaceAllExisting: boolean,
+    onProgress?: (progress: ImportProgressState) => void
   ) => {
+    const rootCats = plan.categories
+      .filter((c) => c.parentTempId === '')
+      .sort((a, b) => a.order - b.order);
+    const subCats = plan.categories
+      .filter((c) => c.parentTempId !== '')
+      .sort((a, b) => a.order - b.order);
+    const orderedBookmarks = [...plan.bookmarks].sort((a, b) => a.order - b.order);
+
+    const totalUnits = Math.max(
+      1,
+      rootCats.length + subCats.length + orderedBookmarks.length
+    );
+    let processedCount = 0;
+    let addedCatCount = 0;
+    let addedBmCount = 0;
+    let skippedDupCount = 0;
+
+    const emitProgress = (
+      phase: ImportProgressState['phase'],
+      currentTitle?: string
+    ) => {
+      onProgress?.({
+        phase,
+        processed: Math.min(totalUnits, processedCount),
+        total: totalUnits,
+        addedBookmarks: addedBmCount,
+        addedCategories: addedCatCount,
+        skippedDuplicates: skippedDupCount,
+        currentTitle,
+      });
+    };
+
+    const tickVisualFrame = async (batchStride: number, index: number) => {
+      if (!onProgress) return;
+      if (!user && index % batchStride === 0) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 14));
+      }
+    };
+
     if (replaceAllExisting) {
+      emitProgress('preparing', 'Clearing previous bookmarks...');
       await handleClearEntireWorkspace();
+    } else {
+      emitProgress('categories', 'Scanning existing categories...');
     }
 
     const existingRootsByName = new Map<string, CategoryItem>();
@@ -854,16 +918,16 @@ export default function App() {
     const expandedMap: Record<string, boolean> = {};
 
     // 1. Create or Match Root Categories in exact order
-    const rootCats = plan.categories
-      .filter((c) => c.parentTempId === '')
-      .sort((a, b) => a.order - b.order);
-
     let nextRootOrder = replaceAllExisting
       ? 0
       : categories.filter((c) => c.parentId === '').length;
 
     for (let i = 0; i < rootCats.length; i++) {
       const rc = rootCats[i];
+      processedCount++;
+      emitProgress('categories', rc.name);
+      await tickVisualFrame(2, i);
+
       const existingMatch = !replaceAllExisting
         ? existingRootsByName.get(rc.name.trim().toLowerCase())
         : undefined;
@@ -877,6 +941,7 @@ export default function App() {
       const realId = generateCleanId(`cat_${i}`);
       tempToRealId[rc.tempId] = realId;
       expandedMap[realId] = true;
+      addedCatCount++;
       const iso = new Date(baseTimeMs + i * 10).toISOString();
       const orderVal = replaceAllExisting ? i : nextRootOrder++;
 
@@ -909,12 +974,12 @@ export default function App() {
     }
 
     // 2. Create or Match Subcategories in exact order under their parent Root Categories
-    const subCats = plan.categories
-      .filter((c) => c.parentTempId !== '')
-      .sort((a, b) => a.order - b.order);
-
     for (let i = 0; i < subCats.length; i++) {
       const sc = subCats[i];
+      processedCount++;
+      emitProgress('categories', sc.name);
+      await tickVisualFrame(3, i);
+
       const parentRealId = tempToRealId[sc.parentTempId];
       if (!parentRealId) continue;
 
@@ -931,6 +996,7 @@ export default function App() {
 
       const realSubId = generateCleanId(`sub_${i}`);
       tempToRealId[sc.tempId] = realSubId;
+      addedCatCount++;
       const iso = new Date(baseTimeMs + 1000 + i * 10).toISOString();
 
       if (user) {
@@ -966,12 +1032,17 @@ export default function App() {
     }
 
     // 3. Create Bookmarks in exact order (skipping duplicates when merging)
-    const orderedBookmarks = [...plan.bookmarks].sort((a, b) => a.order - b.order);
-    let addedBmCount = 0;
+    const localTickStride =
+      orderedBookmarks.length > 180 ? 6 : orderedBookmarks.length > 60 ? 3 : 1;
+
     for (let i = 0; i < orderedBookmarks.length; i++) {
       const bm = orderedBookmarks[i];
+      processedCount++;
       const normalizedUrl = bm.url.trim().toLowerCase();
       if (!replaceAllExisting && existingBookmarkUrls.has(normalizedUrl)) {
+        skippedDupCount++;
+        emitProgress('bookmarks', bm.title);
+        await tickVisualFrame(localTickStride * 2, i);
         continue;
       }
       existingBookmarkUrls.add(normalizedUrl);
@@ -986,6 +1057,9 @@ export default function App() {
       const iso = new Date(baseTimeMs + 5000 + i * 10).toISOString();
       const desc = '';
       addedBmCount++;
+
+      emitProgress('bookmarks', bm.title);
+      await tickVisualFrame(localTickStride, i);
 
       if (user) {
         try {
@@ -1060,6 +1134,9 @@ export default function App() {
       );
       setTimeout(() => setLiveSyncToast(null), 4000);
     }
+
+    processedCount = totalUnits;
+    emitProgress('complete');
   };
 
   // Automatic Direct OS Chrome Path Sync (No file selector needed)
@@ -1245,6 +1322,9 @@ export default function App() {
     }
   }, []);
 
+  const importPlanHandlerRef = useRef(handleImportExactChromePlan);
+  importPlanHandlerRef.current = handleImportExactChromePlan;
+
   // Listen for real-time postMessage from MyFav Chrome Companion Extension
   useEffect(() => {
     const onMessage = async (event: MessageEvent) => {
@@ -1256,13 +1336,13 @@ export default function App() {
       ) {
         const plan = parseChromeBookmarksExactArrangement(event.data.payload);
         if (plan.bookmarks.length > 0 || plan.categories.length > 0) {
-          await handleImportExactChromePlan(plan, false);
+          await importPlanHandlerRef.current(plan, false);
         }
       }
     };
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  });
+  }, []);
 
   // Auto-Watch Linked Chrome Bookmarks File for live changes without re-uploading
   useEffect(() => {
@@ -1409,36 +1489,109 @@ export default function App() {
     targetCategoryId: string,
     targetSubcategoryId: string
   ) => {
+    await handleBatchEditWebsites(bookmarkIds, {
+      category: {
+        categoryId: targetCategoryId,
+        subcategoryId: targetSubcategoryId || '',
+      },
+      favoriteStatus: 'keep',
+    });
+  };
+
+  const handleBatchEditWebsites = async (
+    bookmarkIds: string[],
+    updates: BatchEditPayload
+  ) => {
+    if (bookmarkIds.length === 0) return;
+    const hasCategoryChange = Boolean(updates.category?.categoryId);
+    const hasFavoriteChange =
+      updates.favoriteStatus === 'favorite' ||
+      updates.favoriteStatus === 'unfavorite';
+    if (!hasCategoryChange && !hasFavoriteChange) return;
+
+    setIsBatchEditing(true);
     const nowIso = new Date().toISOString();
-    if (user) {
-      for (const id of bookmarkIds) {
-        try {
-          await updateDoc(doc(db, 'bookmarks', id), {
-            categoryId: targetCategoryId,
-            subcategoryId: targetSubcategoryId || '',
-            updatedAt: serverTimestamp(),
-          });
-        } catch (error) {
-          handleFirestoreError(error, OperationType.UPDATE, `bookmarks/${id}`);
+    const idSet = new Set(bookmarkIds);
+
+    try {
+      if (user) {
+        const CHUNK_SIZE = 450;
+        for (let i = 0; i < bookmarkIds.length; i += CHUNK_SIZE) {
+          const chunk = bookmarkIds.slice(i, i + CHUNK_SIZE);
+          const batch = writeBatch(db);
+          for (const id of chunk) {
+            const payload: Record<string, unknown> = {
+              updatedAt: serverTimestamp(),
+            };
+            if (updates.category) {
+              payload.categoryId = updates.category.categoryId;
+              payload.subcategoryId = updates.category.subcategoryId || '';
+            }
+            if (updates.favoriteStatus === 'favorite') {
+              payload.isFavorite = true;
+            } else if (updates.favoriteStatus === 'unfavorite') {
+              payload.isFavorite = false;
+            }
+            batch.update(doc(db, 'bookmarks', id), payload);
+          }
+          try {
+            await batch.commit();
+          } catch (error) {
+            handleFirestoreError(error, OperationType.UPDATE, 'bookmarks');
+          }
         }
+      } else {
+        setBookmarks((prev) =>
+          prev.map((bm) => {
+            if (!idSet.has(bm.id)) return bm;
+            return {
+              ...bm,
+              ...(updates.category
+                ? {
+                    categoryId: updates.category.categoryId,
+                    subcategoryId: updates.category.subcategoryId || '',
+                  }
+                : {}),
+              ...(updates.favoriteStatus === 'favorite'
+                ? { isFavorite: true }
+                : updates.favoriteStatus === 'unfavorite'
+                ? { isFavorite: false }
+                : {}),
+              updatedAt: nowIso,
+            };
+          })
+        );
       }
-    } else {
-      setBookmarks((prev) =>
-        prev.map((bm) =>
-          bookmarkIds.includes(bm.id)
-            ? {
-                ...bm,
-                categoryId: targetCategoryId,
-                subcategoryId: targetSubcategoryId || '',
-                updatedAt: nowIso,
-              }
-            : bm
-        )
+
+      const parts: string[] = [];
+      if (updates.category) {
+        const catName =
+          categoryMap[updates.category.categoryId]?.name || 'selected category';
+        const subName = updates.category.subcategoryId
+          ? categoryMap[updates.category.subcategoryId]?.name
+          : '';
+        parts.push(`moved to ${catName}${subName ? ` / ${subName}` : ''}`);
+      }
+      if (updates.favoriteStatus === 'favorite') {
+        parts.push('pinned to Favorites');
+      } else if (updates.favoriteStatus === 'unfavorite') {
+        parts.push('removed from Favorites');
+      }
+
+      setLiveSyncToast(
+        `Updated ${bookmarkIds.length} ${
+          bookmarkIds.length === 1 ? 'website' : 'websites'
+        }${parts.length > 0 ? ` (${parts.join(' · ')})` : ''}`
       );
+      setTimeout(() => setLiveSyncToast(null), 3500);
+
+      setSelectedBookmarkIds([]);
+      setConfirmBulkDelete(false);
+      setBulkMode(false);
+      lastSelectedIdRef.current = null;
+    } finally {
+      setIsBatchEditing(false);
     }
-    setSelectedBookmarkIds([]);
-    setConfirmBulkDelete(false);
-    setBulkMode(false);
   };
 
   const handleDeleteSelectedBookmarks = async () => {
@@ -1601,12 +1754,14 @@ export default function App() {
 
     if (user) {
       try {
+        const batch = writeBatch(db);
         for (const sc of reindexed) {
-          await updateDoc(doc(db, 'quickShortcuts', sc.id), {
+          batch.update(doc(db, 'quickShortcuts', sc.id), {
             order: sc.order,
             updatedAt: serverTimestamp(),
           });
         }
+        await batch.commit();
       } catch (error) {
         handleFirestoreError(error, OperationType.UPDATE, 'quickShortcuts');
       }
@@ -1664,12 +1819,13 @@ export default function App() {
   const handleUpdateCategory = async (id: string, name: string, icon: string) => {
     const cleanName = name.trim().slice(0, 80);
     if (!cleanName) return;
+    const safeIcon = /^[a-zA-Z0-9_-]{1,40}$/.test(icon) ? icon : 'bookmark';
 
     if (user) {
       try {
         await updateDoc(doc(db, 'categories', id), {
           name: cleanName,
-          icon,
+          icon: safeIcon,
           updatedAt: serverTimestamp(),
         });
       } catch (error) {
@@ -1679,7 +1835,7 @@ export default function App() {
       setCategories((prev) =>
         prev.map((c) =>
           c.id === id
-            ? { ...c, name: cleanName, icon, updatedAt: new Date().toISOString() }
+            ? { ...c, name: cleanName, icon: safeIcon, updatedAt: new Date().toISOString() }
             : c
         )
       );
@@ -2226,8 +2382,25 @@ export default function App() {
     }
   };
 
-  const toggleBulkSelect = (id: string) => {
+  const toggleBulkSelect = (id: string, shiftKey = false) => {
     setConfirmBulkDelete(false);
+
+    if (shiftKey && lastSelectedIdRef.current) {
+      const startIndex = filteredBookmarks.findIndex(
+        (b) => b.id === lastSelectedIdRef.current
+      );
+      const endIndex = filteredBookmarks.findIndex((b) => b.id === id);
+      if (startIndex !== -1 && endIndex !== -1) {
+        const [from, to] =
+          startIndex < endIndex ? [startIndex, endIndex] : [endIndex, startIndex];
+        const rangeIds = filteredBookmarks.slice(from, to + 1).map((b) => b.id);
+        setSelectedBookmarkIds((prev) => Array.from(new Set([...prev, ...rangeIds])));
+        lastSelectedIdRef.current = id;
+        return;
+      }
+    }
+
+    lastSelectedIdRef.current = id;
     setSelectedBookmarkIds((prev) =>
       prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
     );
@@ -3529,14 +3702,15 @@ export default function App() {
                           if (prev) {
                             setSelectedBookmarkIds([]);
                             setConfirmBulkDelete(false);
+                            lastSelectedIdRef.current = null;
                           }
                           return !prev;
                         });
                       }}
                       title={
                         bulkMode
-                          ? 'Exit bulk selection mode'
-                          : 'Select multiple websites to move or delete'
+                          ? 'Exit batch selection mode'
+                          : 'Select multiple websites to batch edit category, favorites, or delete'
                       }
                       className={`min-h-[38px] px-3 py-1.5 rounded-xl border text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                         bulkMode
@@ -3545,94 +3719,156 @@ export default function App() {
                       }`}
                     >
                       <CheckSquare className="w-3.5 h-3.5" />
-                      <span>{bulkMode ? 'Done' : 'Select'}</span>
+                      <span>{bulkMode ? 'Done' : 'Batch Edit'}</span>
                     </button>
                   </div>
                 </div>
 
                 {/* Bulk Action Banner */}
-                {bulkMode && (
-                  <div className="p-3 rounded-xl accent-subtle-bg border accent-border flex flex-wrap items-center justify-between gap-3">
-                    <div className="flex items-center gap-3">
-                      <span className="text-xs font-semibold text-white font-mono-tabular">
-                        {selectedBookmarkIds.length} selected
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setConfirmBulkDelete(false);
-                          setSelectedBookmarkIds(
-                            selectedBookmarkIds.length === filteredBookmarks.length
-                              ? []
-                              : filteredBookmarks.map((b) => b.id)
-                          );
-                        }}
-                        className="text-xs accent-text hover:underline cursor-pointer"
-                      >
-                        {selectedBookmarkIds.length === filteredBookmarks.length
-                          ? 'Deselect All'
-                          : 'Select All Visible'}
-                      </button>
-                    </div>
+                {bulkMode && (() => {
+                  const selectedBookmarksList = bookmarks.filter((b) =>
+                    selectedBookmarkIds.includes(b.id)
+                  );
+                  const hasUnpinnedSelected = selectedBookmarksList.some(
+                    (b) => !b.isFavorite
+                  );
+                  const hasPinnedSelected = selectedBookmarksList.some(
+                    (b) => b.isFavorite
+                  );
 
-                    <div className="flex flex-wrap items-center gap-2">
-                      {confirmBulkDelete ? (
-                        <>
-                          <span className="text-xs text-rose-200 font-medium">
-                            Delete {selectedBookmarkIds.length}{' '}
-                            {selectedBookmarkIds.length === 1 ? 'bookmark' : 'bookmarks'}?
+                  return (
+                    <div className="p-3 rounded-xl accent-subtle-bg border accent-border flex flex-wrap items-center justify-between gap-3">
+                      <div className="flex flex-wrap items-center gap-3">
+                        <span className="text-xs font-semibold text-white font-mono-tabular">
+                          {selectedBookmarkIds.length} selected
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setConfirmBulkDelete(false);
+                            setSelectedBookmarkIds(
+                              selectedBookmarkIds.length === filteredBookmarks.length
+                                ? []
+                                : filteredBookmarks.map((b) => b.id)
+                            );
+                          }}
+                          className="text-xs accent-text hover:underline cursor-pointer"
+                        >
+                          {selectedBookmarkIds.length === filteredBookmarks.length
+                            ? 'Deselect All'
+                            : 'Select All Visible'}
+                        </button>
+                        {selectedBookmarkIds.length > 0 && (
+                          <span className="hidden sm:inline text-[11px] text-slate-400">
+                            Tip: Hold Shift + click to select a range
                           </span>
-                          <button
-                            type="button"
-                            disabled={isBulkDeleting}
-                            onClick={() => setConfirmBulkDelete(false)}
-                            className="min-h-[36px] px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 text-xs font-medium text-slate-200 cursor-pointer disabled:opacity-40"
-                          >
-                            Cancel
-                          </button>
-                          <button
-                            type="button"
-                            disabled={isBulkDeleting || selectedBookmarkIds.length === 0}
-                            onClick={handleDeleteSelectedBookmarks}
-                            className="min-h-[36px] px-4 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-40 transition-colors"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                            <span>
-                              {isBulkDeleting ? 'Deleting...' : 'Confirm Delete'}
-                            </span>
-                          </button>
-                        </>
-                      ) : (
-                        <>
-                          <button
-                            type="button"
-                            disabled={selectedBookmarkIds.length === 0 || isBulkDeleting}
-                            onClick={() => setConfirmBulkDelete(true)}
-                            className="min-h-[36px] px-3.5 py-1.5 rounded-xl bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/30 text-rose-200 text-xs font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-40 transition-colors"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                            <span>Delete Selected</span>
-                          </button>
+                        )}
+                      </div>
 
-                          <button
-                            type="button"
-                            disabled={selectedBookmarkIds.length === 0 || isBulkDeleting}
-                            onClick={() => {
-                              const items = bookmarks.filter((b) =>
-                                selectedBookmarkIds.includes(b.id)
-                              );
-                              setBookmarksToMove(items);
-                            }}
-                            className="min-h-[36px] px-4 py-1.5 rounded-xl accent-bg text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-40"
-                          >
-                            <ArrowRightLeft className="w-3.5 h-3.5" />
-                            <span>Move Selected Websites</span>
-                          </button>
-                        </>
-                      )}
+                      <div className="flex flex-wrap items-center gap-2">
+                        {confirmBulkDelete ? (
+                          <>
+                            <span className="text-xs text-rose-200 font-medium">
+                              Delete {selectedBookmarkIds.length}{' '}
+                              {selectedBookmarkIds.length === 1 ? 'bookmark' : 'bookmarks'}?
+                            </span>
+                            <button
+                              type="button"
+                              disabled={isBulkDeleting}
+                              onClick={() => setConfirmBulkDelete(false)}
+                              className="min-h-[36px] px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 text-xs font-medium text-slate-200 cursor-pointer disabled:opacity-40"
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              type="button"
+                              disabled={isBulkDeleting || selectedBookmarkIds.length === 0}
+                              onClick={handleDeleteSelectedBookmarks}
+                              className="min-h-[36px] px-4 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-40 transition-colors"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                              <span>
+                                {isBulkDeleting ? 'Deleting...' : 'Confirm Delete'}
+                              </span>
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            {hasUnpinnedSelected && (
+                              <button
+                                type="button"
+                                disabled={
+                                  selectedBookmarkIds.length === 0 ||
+                                  isBulkDeleting ||
+                                  isBatchEditing
+                                }
+                                onClick={() =>
+                                  handleBatchEditWebsites(selectedBookmarkIds, {
+                                    favoriteStatus: 'favorite',
+                                  })
+                                }
+                                title="Pin all selected websites to Favorites in one operation"
+                                className="min-h-[36px] px-3 py-1.5 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 text-xs font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-40 transition-colors whitespace-nowrap"
+                              >
+                                <Star className="w-3.5 h-3.5 fill-amber-400 text-amber-400" />
+                                <span>Pin Favorites</span>
+                              </button>
+                            )}
+
+                            {hasPinnedSelected && (
+                              <button
+                                type="button"
+                                disabled={
+                                  selectedBookmarkIds.length === 0 ||
+                                  isBulkDeleting ||
+                                  isBatchEditing
+                                }
+                                onClick={() =>
+                                  handleBatchEditWebsites(selectedBookmarkIds, {
+                                    favoriteStatus: 'unfavorite',
+                                  })
+                                }
+                                title="Remove all selected websites from Favorites"
+                                className="min-h-[36px] px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/15 text-slate-200 text-xs font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-40 transition-colors whitespace-nowrap"
+                              >
+                                <StarOff className="w-3.5 h-3.5" />
+                                <span>Unpin</span>
+                              </button>
+                            )}
+
+                            <button
+                              type="button"
+                              disabled={
+                                selectedBookmarkIds.length === 0 ||
+                                isBulkDeleting ||
+                                isBatchEditing
+                              }
+                              onClick={() => setConfirmBulkDelete(true)}
+                              className="min-h-[36px] px-3 py-1.5 rounded-xl bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/30 text-rose-200 text-xs font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-40 transition-colors whitespace-nowrap"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                              <span>Delete</span>
+                            </button>
+
+                            <button
+                              type="button"
+                              disabled={
+                                selectedBookmarkIds.length === 0 ||
+                                isBulkDeleting ||
+                                isBatchEditing
+                              }
+                              onClick={() => setBookmarksToBatchEdit(selectedBookmarksList)}
+                              className="min-h-[36px] px-4 py-1.5 rounded-xl accent-bg text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-40 whitespace-nowrap"
+                            >
+                              <SlidersHorizontal className="w-3.5 h-3.5" />
+                              <span>Batch Edit ({selectedBookmarkIds.length})</span>
+                            </button>
+                          </>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                )}
+                  );
+                })()}
               </section>
 
               {/* Loading Skeleton or Website Cards Grid */}
@@ -3742,17 +3978,23 @@ export default function App() {
                     return (
                       <article
                         key={bm.id}
-                        draggable
+                        draggable={!bulkMode}
                         onDragStart={() => setDraggedBookmarkId(bm.id)}
                         onDragEnd={() => {
                           setDraggedBookmarkId(null);
                           setDragOverTarget(null);
                         }}
+                        onClick={(e) => {
+                          if (!bulkMode) return;
+                          const target = e.target as HTMLElement | null;
+                          if (target?.closest('a, button, input')) return;
+                          toggleBulkSelect(bm.id, e.shiftKey);
+                        }}
                         className={`glass-surface website-card flex flex-col md:flex-row md:items-center justify-between group ${
                           isCompact
                             ? 'rounded-xl px-3 py-1.5 sm:py-2 gap-2'
                             : 'rounded-2xl p-4 sm:p-4.5 gap-3.5'
-                        } ${
+                        } ${bulkMode ? 'cursor-pointer select-none' : ''} ${
                           isSelected
                             ? 'accent-border ring-1 ring-[var(--accent-primary)]'
                             : 'hover:border-white/20'
@@ -3767,7 +4009,13 @@ export default function App() {
                           {bulkMode ? (
                             <button
                               type="button"
-                              onClick={() => toggleBulkSelect(bm.id)}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleBulkSelect(bm.id, e.shiftKey);
+                              }}
+                              aria-label={
+                                isSelected ? `Deselect ${bm.title}` : `Select ${bm.title}`
+                              }
                               className={`${
                                 isCompact ? 'w-7.5 h-7.5 rounded-lg' : 'w-10 h-10 rounded-xl'
                               } bg-slate-900 border border-white/15 flex items-center justify-center shrink-0 cursor-pointer`}
@@ -3779,7 +4027,26 @@ export default function App() {
                               )}
                             </button>
                           ) : (
-                            <WebsiteFavicon url={bm.url} title={bm.title} compact={isCompact} />
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setBulkMode(true);
+                                toggleBulkSelect(bm.id, e.shiftKey);
+                              }}
+                              title="Select website for batch edit"
+                              aria-label={`Select ${bm.title} for batch edit`}
+                              className="relative group/fav shrink-0 cursor-pointer rounded-xl"
+                            >
+                              <WebsiteFavicon url={bm.url} title={bm.title} compact={isCompact} />
+                              <span
+                                className={`absolute inset-0 ${
+                                  isCompact ? 'rounded-lg' : 'rounded-xl'
+                                } bg-slate-950/80 border border-white/20 flex items-center justify-center opacity-0 group-hover/fav:opacity-100 transition-opacity`}
+                              >
+                                <Square className="w-4 h-4 accent-text" />
+                              </span>
+                            </button>
                           )}
 
                           {isCompact ? (
@@ -3944,32 +4211,14 @@ export default function App() {
 
                           <button
                             type="button"
-                            onClick={() => setPreviewingBookmark(bm)}
-                            title="Preview live website in modal"
-                            className={`${
-                              isCompact
-                                ? 'min-h-[28px] px-2 py-0.5 text-[11px]'
-                                : 'min-h-[36px] px-3 py-1 text-xs'
-                            } rounded-lg bg-white/5 hover:bg-white/10 font-medium text-slate-300 hover:text-white flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap`}
-                          >
-                            <Eye className="w-3.5 h-3.5 accent-text" />
-                            <span>Preview</span>
-                          </button>
-
-                          <button
-                            type="button"
                             onClick={() => setBookmarksToMove([bm])}
+                            aria-label="Move to another category or subcategory"
                             title="Move to another category or subcategory"
                             className={`${
-                              isCompact
-                                ? 'min-h-[28px] px-2 py-0.5 text-[11px]'
-                                : 'min-h-[36px] px-3 py-1 text-xs'
-                            } rounded-lg bg-white/5 hover:bg-white/10 font-medium text-slate-300 hover:text-white flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap`}
+                              isCompact ? 'min-h-[28px] min-w-[28px]' : 'min-h-[36px] min-w-[36px]'
+                            } rounded-lg text-slate-400 hover:text-[var(--accent-light)] hover:bg-white/5 flex items-center justify-center transition-colors cursor-pointer`}
                           >
-                            <ArrowRightLeft className="w-3.5 h-3.5 accent-text" />
-                            <span className={isCompact ? 'hidden xl:inline' : 'hidden sm:inline'}>
-                              Move
-                            </span>
+                            <ArrowRightLeft className="w-3.5 h-3.5" />
                           </button>
 
                           <button
@@ -4125,6 +4374,14 @@ export default function App() {
         bookmarksToMove={bookmarksToMove}
         categories={categories}
         onConfirmMove={handleMoveWebsites}
+      />
+
+      <BatchEditModal
+        isOpen={bookmarksToBatchEdit.length > 0}
+        onClose={() => setBookmarksToBatchEdit([])}
+        bookmarksToEdit={bookmarksToBatchEdit}
+        categories={categories}
+        onConfirmBatchEdit={handleBatchEditWebsites}
       />
 
       <WebsitePreviewModal
