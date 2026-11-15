@@ -82,6 +82,11 @@ import {
 } from './components/CategoryIcon';
 import { applyThemeToDom } from './utils/theme';
 import {
+  initGoogleAnalytics,
+  trackEvent,
+  trackPageView,
+} from './utils/analytics';
+import {
   ChromeImportPlan,
   inferIconForFolderName,
   parseChromeBookmarksExactArrangement,
@@ -216,6 +221,8 @@ export default function App() {
   // Bulk Selection & Drag-and-Drop State
   const [bulkMode, setBulkMode] = useState(false);
   const [selectedBookmarkIds, setSelectedBookmarkIds] = useState<string[]>([]);
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
+  const [isBulkDeleting, setIsBulkDeleting] = useState(false);
   const [draggedBookmarkId, setDraggedBookmarkId] = useState<string | null>(null);
   const [draggedCategoryId, setDraggedCategoryId] = useState<string | null>(null);
   const [draggedShortcutId, setDraggedShortcutId] = useState<string | null>(null);
@@ -352,6 +359,33 @@ export default function App() {
     window.addEventListener('popstate', handlePopState);
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
+
+  // Initialize Google Analytics (GA4) when VITE_GA_MEASUREMENT_ID is configured
+  useEffect(() => {
+    void initGoogleAnalytics();
+  }, []);
+
+  // Track virtual page views across MyFav sections and shared links
+  useEffect(() => {
+    if (activeShareId) {
+      trackPageView(`/?share=${activeShareId}`, 'MyFav — Shared Category Collection');
+      return;
+    }
+    const pagePath =
+      activeView === 'all' && selectedCategoryId !== 'all'
+        ? `/category/${selectedCategoryId}`
+        : `/${activeView}`;
+    const pageTitle = `MyFav — ${
+      activeView === 'categories'
+        ? 'Categories'
+        : activeView === 'settings' || activeView === 'chrome-sync'
+        ? 'Settings'
+        : activeView === 'favorites'
+        ? 'Favorites'
+        : 'Directory'
+    }`;
+    trackPageView(pagePath, pageTitle);
+  }, [activeView, selectedCategoryId, activeShareId]);
 
   // Firebase Auth listener
   useEffect(() => {
@@ -1403,7 +1437,40 @@ export default function App() {
       );
     }
     setSelectedBookmarkIds([]);
+    setConfirmBulkDelete(false);
     setBulkMode(false);
+  };
+
+  const handleDeleteSelectedBookmarks = async () => {
+    if (selectedBookmarkIds.length === 0) return;
+    setIsBulkDeleting(true);
+    const idsToDelete = [...selectedBookmarkIds];
+    const idSet = new Set(idsToDelete);
+
+    try {
+      if (user) {
+        const CHUNK_SIZE = 450;
+        for (let i = 0; i < idsToDelete.length; i += CHUNK_SIZE) {
+          const chunk = idsToDelete.slice(i, i + CHUNK_SIZE);
+          const batch = writeBatch(db);
+          for (const id of chunk) {
+            batch.delete(doc(db, 'bookmarks', id));
+          }
+          try {
+            await batch.commit();
+          } catch (error) {
+            handleFirestoreError(error, OperationType.DELETE, 'bookmarks');
+          }
+        }
+      } else {
+        setBookmarks((prev) => prev.filter((item) => !idSet.has(item.id)));
+      }
+      setSelectedBookmarkIds([]);
+      setConfirmBulkDelete(false);
+      setBulkMode(false);
+    } finally {
+      setIsBulkDeleting(false);
+    }
   };
 
   // CRUD Handlers for Quick Access Shortcuts
@@ -1814,6 +1881,11 @@ export default function App() {
       );
     }
 
+    trackEvent('share_category', {
+      category_id: category.id,
+      bookmark_count: catBookmarks.length,
+    });
+
     return {
       id: newShareId,
       ownerId: user.uid,
@@ -2155,6 +2227,7 @@ export default function App() {
   };
 
   const toggleBulkSelect = (id: string) => {
+    setConfirmBulkDelete(false);
     setSelectedBookmarkIds((prev) =>
       prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
     );
@@ -3447,10 +3520,37 @@ export default function App() {
                         );
                       })}
                     </div>
+
+                    {/* Bulk Select Mode Toggle */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setBulkMode((prev) => {
+                          if (prev) {
+                            setSelectedBookmarkIds([]);
+                            setConfirmBulkDelete(false);
+                          }
+                          return !prev;
+                        });
+                      }}
+                      title={
+                        bulkMode
+                          ? 'Exit bulk selection mode'
+                          : 'Select multiple websites to move or delete'
+                      }
+                      className={`min-h-[38px] px-3 py-1.5 rounded-xl border text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                        bulkMode
+                          ? 'accent-subtle-bg accent-border accent-text font-semibold'
+                          : 'bg-slate-950/70 border-white/10 text-slate-300 hover:text-white hover:bg-white/5'
+                      }`}
+                    >
+                      <CheckSquare className="w-3.5 h-3.5" />
+                      <span>{bulkMode ? 'Done' : 'Select'}</span>
+                    </button>
                   </div>
                 </div>
 
-                {/* Bulk Move Action Banner */}
+                {/* Bulk Action Banner */}
                 {bulkMode && (
                   <div className="p-3 rounded-xl accent-subtle-bg border accent-border flex flex-wrap items-center justify-between gap-3">
                     <div className="flex items-center gap-3">
@@ -3459,13 +3559,14 @@ export default function App() {
                       </span>
                       <button
                         type="button"
-                        onClick={() =>
+                        onClick={() => {
+                          setConfirmBulkDelete(false);
                           setSelectedBookmarkIds(
                             selectedBookmarkIds.length === filteredBookmarks.length
                               ? []
                               : filteredBookmarks.map((b) => b.id)
-                          )
-                        }
+                          );
+                        }}
                         className="text-xs accent-text hover:underline cursor-pointer"
                       >
                         {selectedBookmarkIds.length === filteredBookmarks.length
@@ -3474,21 +3575,61 @@ export default function App() {
                       </button>
                     </div>
 
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        disabled={selectedBookmarkIds.length === 0}
-                        onClick={() => {
-                          const items = bookmarks.filter((b) =>
-                            selectedBookmarkIds.includes(b.id)
-                          );
-                          setBookmarksToMove(items);
-                        }}
-                        className="min-h-[36px] px-4 py-1.5 rounded-xl accent-bg text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-40"
-                      >
-                        <ArrowRightLeft className="w-3.5 h-3.5" />
-                        <span>Move Selected Websites</span>
-                      </button>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {confirmBulkDelete ? (
+                        <>
+                          <span className="text-xs text-rose-200 font-medium">
+                            Delete {selectedBookmarkIds.length}{' '}
+                            {selectedBookmarkIds.length === 1 ? 'bookmark' : 'bookmarks'}?
+                          </span>
+                          <button
+                            type="button"
+                            disabled={isBulkDeleting}
+                            onClick={() => setConfirmBulkDelete(false)}
+                            className="min-h-[36px] px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 text-xs font-medium text-slate-200 cursor-pointer disabled:opacity-40"
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            type="button"
+                            disabled={isBulkDeleting || selectedBookmarkIds.length === 0}
+                            onClick={handleDeleteSelectedBookmarks}
+                            className="min-h-[36px] px-4 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-40 transition-colors"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>
+                              {isBulkDeleting ? 'Deleting...' : 'Confirm Delete'}
+                            </span>
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            disabled={selectedBookmarkIds.length === 0 || isBulkDeleting}
+                            onClick={() => setConfirmBulkDelete(true)}
+                            className="min-h-[36px] px-3.5 py-1.5 rounded-xl bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/30 text-rose-200 text-xs font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-40 transition-colors"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>Delete Selected</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            disabled={selectedBookmarkIds.length === 0 || isBulkDeleting}
+                            onClick={() => {
+                              const items = bookmarks.filter((b) =>
+                                selectedBookmarkIds.includes(b.id)
+                              );
+                              setBookmarksToMove(items);
+                            }}
+                            className="min-h-[36px] px-4 py-1.5 rounded-xl accent-bg text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-40"
+                          >
+                            <ArrowRightLeft className="w-3.5 h-3.5" />
+                            <span>Move Selected Websites</span>
+                          </button>
+                        </>
+                      )}
                     </div>
                   </div>
                 )}

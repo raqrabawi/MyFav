@@ -1,12 +1,12 @@
 {
-  "projectId": "al-lista-app",
-  "appId": "1:229934453497:web:291b7d2be3be85bc9b8828",
-  "apiKey": "AIzaSyDnnc3pmJ1wdSxeAEOUupBLqdJLj7SsKAg",
-  "authDomain": "al-lista-app.firebaseapp.com",
+  "projectId": "myfav-514820",
+  "appId": "1:726275669688:web:3c58c4b190baedbc90fe4d",
+  "apiKey": "AIzaSyCSDXIt0LK7fTOiAkDcWLrsHGTeCWxlheg",
+  "authDomain": "myfav-514820.firebaseapp.com",
   "firestoreDatabaseId": "ai-studio-59ca64eb-9f7e-4b84-a099-5366ff8c26ab",
-  "storageBucket": "al-lista-app.firebasestorage.app",
-  "messagingSenderId": "229934453497",
+  "storageBucket": "myfav-514820.firebasestorage.app",
+  "messagingSenderId": "726275669688",
   "measurementId": "",
-  "oAuthClientId": "229934453497-q5iulgu7bev6388mmqauqn0ijn92vd3e.apps.googleusercontent.com",
+  "oAuthClientId": "726275669688-nspvnrhnddevdj8sqe53mj1p19t8aqk4.apps.googleusercontent.com",
   "recaptchaSiteKey": ""
 }
