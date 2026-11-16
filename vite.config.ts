@@ -38,7 +38,7 @@ export default defineConfig(({mode}) => {
     plugins: [react(), tailwindcss(), googleTagManagerPlugin(gtmId)],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, '.'),
+        '@': path.resolve(import.meta.dirname, '.'),
       },
     },
     server: {
