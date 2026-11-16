@@ -68,7 +68,7 @@ export const AccountSyncModal: React.FC<AccountSyncModalProps> = ({
               <h2 className="text-base sm:text-lg font-semibold text-slate-100 truncate">
                 {hasLocalData
                   ? 'Sync Your Local Workspace?'
-                  : 'Welcome to Google Cloud Sync'}
+                  : 'Welcome to Cloud Sync'}
               </h2>
               <p className="text-xs text-slate-400 truncate mt-0.5">
                 Signed in as <span className="text-slate-200 font-medium">{displayName}</span>
@@ -95,7 +95,7 @@ export const AccountSyncModal: React.FC<AccountSyncModalProps> = ({
                 </span>
               </div>
               <div className="p-3.5">
-                <span className="block text-[11px] text-slate-400">Saved in Google</span>
+                <span className="block text-[11px] text-slate-400">Saved in Cloud</span>
                 <span className="mt-1 block text-xs sm:text-sm font-semibold text-slate-100 font-mono-tabular">
                   {cloudCounts.categories} folders · {cloudCounts.bookmarks} sites
                 </span>
@@ -105,7 +105,7 @@ export const AccountSyncModal: React.FC<AccountSyncModalProps> = ({
             <div className="p-4 rounded-xl border border-white/10 bg-slate-950/55 flex items-center justify-between gap-3">
               <div>
                 <span className="block text-[11px] text-slate-400">
-                  Saved in Your Google Account
+                  Saved in Your Account
                 </span>
                 <span className="mt-0.5 block text-sm font-semibold text-slate-100 font-mono-tabular">
                   {hasCloudData

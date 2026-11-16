@@ -289,7 +289,7 @@ export const ChromeSyncPage: React.FC<ChromeSyncPageProps> = ({
             onClick={onSignInWithGoogle}
             className="min-h-[40px] px-4 py-2 rounded-xl accent-subtle-bg hover:bg-white/10 border accent-border accent-text text-xs font-semibold flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
-            Sign in with Google
+            Log in
           </button>
         )}
       </section>

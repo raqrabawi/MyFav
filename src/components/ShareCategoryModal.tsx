@@ -234,7 +234,7 @@ export const ShareCategoryModal: React.FC<ShareCategoryModalProps> = ({
                 <Lock className="w-4 h-4 accent-text shrink-0 mt-0.5" />
                 <div className="space-y-1">
                   <p className="text-xs font-semibold text-slate-100">
-                    Sign in with Google to Publish Public Link
+                    Log in to Publish Public Link
                   </p>
                   <p className="text-xs text-slate-400 leading-relaxed">
                     Hosting a public, read-only link saves a snapshot of this category to your cloud workspace so anyone with the URL can view it from any browser or device.
@@ -248,11 +248,7 @@ export const ShareCategoryModal: React.FC<ShareCategoryModalProps> = ({
                 className="w-full min-h-[40px] px-4 py-2 rounded-xl accent-bg text-white text-xs font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer disabled:opacity-50"
               >
                 <Globe className="w-4 h-4" />
-                <span>
-                  {isSigningIn
-                    ? 'Connecting Google Account...'
-                    : 'Sign in with Google & Generate Link'}
-                </span>
+                <span>Log in</span>
               </button>
             </div>
           ) : isPublishing && !activeShare ? (

@@ -43,27 +43,14 @@ import {
   User,
 } from 'firebase/auth';
 import {
-  collection,
-  doc,
-  getDocs,
-  onSnapshot,
-  query,
-  where,
-  setDoc,
-  updateDoc,
-  deleteDoc,
-  writeBatch,
-  serverTimestamp,
-  Timestamp,
-} from 'firebase/firestore';
-import {
   auth,
-  db,
-  handleFirestoreError,
-  OperationType,
+  registerWithEmail,
+  sendPasswordReset,
+  signInWithEmail,
   signInWithGoogle,
   signOutUser,
 } from './firebase';
+import { apiClient } from './lib/apiClient';
 import {
   BookmarkItem,
   CategoryItem,
@@ -113,6 +100,7 @@ import { MyFavLogo } from './components/MyFavLogo';
 import { ShareCategoryModal } from './components/ShareCategoryModal';
 import { SharedCollectionView } from './components/SharedCollectionView';
 import { AccountSyncModal } from './components/AccountSyncModal';
+import { AuthPage, AuthPageMode } from './components/AuthPage';
 
 const STORAGE_KEYS = {
   CATEGORIES: 'aethermark_categories_v1',
@@ -130,14 +118,6 @@ const MAC_DEFAULT_CHROME_PATH = `~/Library/Application Support/Google/Chrome/Def
 function generateCleanId(prefix: string): string {
   const randomPart = Math.random().toString(36).substring(2, 10);
   return `${prefix}_${Date.now()}_${randomPart}`;
-}
-
-function timestampToIso(val: unknown): string {
-  if (val instanceof Timestamp) {
-    return val.toDate().toISOString();
-  }
-  if (typeof val === 'string') return val;
-  return new Date().toISOString();
 }
 
 export default function App() {
@@ -241,6 +221,7 @@ export default function App() {
   const [activeView, setActiveView] = useState<
     'all' | 'favorites' | 'categories' | 'settings' | 'chrome-sync'
   >('all');
+  const [authPageMode, setAuthPageMode] = useState<AuthPageMode | null>(null);
   const [selectedCategoryId, setSelectedCategoryId] = useState<string>('all');
   const [selectedSubcategoryId, setSelectedSubcategoryId] = useState<string>('all');
   const [expandedCategories, setExpandedCategories] = useState<Record<string, boolean>>({});
@@ -420,11 +401,26 @@ export default function App() {
     trackPageView(pagePath, pageTitle);
   }, [activeView, selectedCategoryId, activeShareId]);
 
+  const openAuthPage = (mode: AuthPageMode = 'login') => {
+    setAuthPageMode(mode);
+  };
+
+  const closeAuthPage = () => {
+    setAuthPageMode(null);
+  };
+
+  useEffect(() => {
+    if (user && authPageMode !== null) {
+      closeAuthPage();
+    }
+  }, [user, authPageMode]);
+
   const handleGoogleLogin = async () => {
     freshSignInTriggeredRef.current = true;
     setSyncChoiceError('');
     try {
       await signInWithGoogle();
+      closeAuthPage();
     } catch (error) {
       freshSignInTriggeredRef.current = false;
       const code =
@@ -438,7 +434,40 @@ export default function App() {
         return;
       }
       console.error('Google sign-in failed:', error);
+      throw error;
     }
+  };
+
+  const handleEmailLogin = async (email: string, password: string) => {
+    freshSignInTriggeredRef.current = true;
+    setSyncChoiceError('');
+    try {
+      await signInWithEmail(email, password);
+      closeAuthPage();
+    } catch (error) {
+      freshSignInTriggeredRef.current = false;
+      throw error;
+    }
+  };
+
+  const handleEmailRegister = async (
+    name: string,
+    email: string,
+    password: string
+  ) => {
+    freshSignInTriggeredRef.current = true;
+    setSyncChoiceError('');
+    try {
+      await registerWithEmail(name, email, password);
+      closeAuthPage();
+    } catch (error) {
+      freshSignInTriggeredRef.current = false;
+      throw error;
+    }
+  };
+
+  const handlePasswordReset = async (email: string) => {
+    await sendPasswordReset(email);
   };
 
   const handleSignOut = async () => {
@@ -494,81 +523,17 @@ export default function App() {
       setSyncChoiceError('');
 
       try {
-        const [catSnap, bmSnap, scSnap] = await Promise.all([
-          getDocs(
-            query(collection(db, 'categories'), where('ownerId', '==', currentUser.uid))
-          ),
-          getDocs(
-            query(collection(db, 'bookmarks'), where('ownerId', '==', currentUser.uid))
-          ),
-          getDocs(
-            query(collection(db, 'quickShortcuts'), where('ownerId', '==', currentUser.uid))
-          ),
-        ]);
-
+        const cloudData = await apiClient.getWorkspace();
         if (cancelled) return;
-
-        const cloudCategories: CategoryItem[] = catSnap.docs
-          .filter((docSnap) => !DEMO_CATEGORY_IDS.has(docSnap.id))
-          .map((docSnap) => {
-            const d = docSnap.data();
-            return {
-              id: docSnap.id,
-              ownerId: d.ownerId,
-              name: d.name,
-              icon: d.icon,
-              parentId: d.parentId || '',
-              order: typeof d.order === 'number' ? d.order : 0,
-              createdAt: timestampToIso(d.createdAt),
-              updatedAt: timestampToIso(d.updatedAt),
-            };
-          });
-
-        const cloudBookmarks: BookmarkItem[] = bmSnap.docs
-          .filter(
-            (docSnap) =>
-              !DEMO_BOOKMARK_IDS.has(docSnap.id) &&
-              !DEMO_CATEGORY_IDS.has(docSnap.data()?.categoryId)
-          )
-          .map((docSnap) => {
-            const d = docSnap.data();
-            return {
-              id: docSnap.id,
-              ownerId: d.ownerId,
-              title: d.title,
-              url: d.url,
-              description: d.description || '',
-              categoryId: d.categoryId,
-              subcategoryId: d.subcategoryId || '',
-              isFavorite: Boolean(d.isFavorite),
-              createdAt: timestampToIso(d.createdAt),
-              updatedAt: timestampToIso(d.updatedAt),
-            };
-          });
-
-        const cloudShortcuts: QuickShortcutItem[] = scSnap.docs.map((docSnap) => {
-          const d = docSnap.data();
-          return {
-            id: docSnap.id,
-            ownerId: d.ownerId,
-            title: d.title,
-            url: d.url,
-            iconType: (d.iconType as QuickShortcutIconType) || 'favicon',
-            customIcon: d.customIcon || '',
-            order: typeof d.order === 'number' ? d.order : 0,
-            createdAt: timestampToIso(d.createdAt),
-            updatedAt: timestampToIso(d.updatedAt),
-          };
-        });
 
         setPendingSyncChoice({
           targetUser: currentUser,
           localCategories: localCategoriesRef.current,
           localBookmarks: localBookmarksRef.current,
           localShortcuts: localQuickShortcutsRef.current,
-          cloudCategories,
-          cloudBookmarks,
-          cloudShortcuts,
+          cloudCategories: cloudData.categories,
+          cloudBookmarks: cloudData.bookmarks,
+          cloudShortcuts: cloudData.quickShortcuts,
         });
         setSyncGateStatus('awaiting_choice');
         setCloudLoading(false);
@@ -586,7 +551,7 @@ export default function App() {
     };
   }, []);
 
-  // Firestore real-time synchronization when signed in & sync choice resolved
+  // Load workspace data from Cloud SQL PostgreSQL when signed in & sync choice resolved
   useEffect(() => {
     if (!authReady || !user || syncGateStatus !== 'ready') {
       if (!user) {
@@ -596,192 +561,40 @@ export default function App() {
       return;
     }
 
+    let cancelled = false;
     setCloudLoading(true);
 
-    const categoriesQuery = query(
-      collection(db, 'categories'),
-      where('ownerId', '==', user.uid)
-    );
-    const bookmarksQuery = query(
-      collection(db, 'bookmarks'),
-      where('ownerId', '==', user.uid)
-    );
-    const quickShortcutsQuery = query(
-      collection(db, 'quickShortcuts'),
-      where('ownerId', '==', user.uid)
-    );
-    const settingsDocRef = doc(db, 'userSettings', user.uid);
-
-    const unsubCategories = onSnapshot(
-      categoriesQuery,
-      async (snapshot) => {
-        // Automatically purge any leftover demo categories & subcategories from Firestore
-        const demoCatDocs = snapshot.docs.filter((d) => DEMO_CATEGORY_IDS.has(d.id));
-        if (demoCatDocs.length > 0) {
-          for (const demoDoc of demoCatDocs) {
-            try {
-              await deleteDoc(doc(db, 'categories', demoDoc.id));
-            } catch {
-              // ignore
-            }
-          }
-        }
-
-        const validDocs = snapshot.docs.filter(
-          (docSnap) => !DEMO_CATEGORY_IDS.has(docSnap.id)
-        );
-
-        const loadedCategories: CategoryItem[] = validDocs.map((docSnap) => {
-          const d = docSnap.data();
-          return {
-            id: docSnap.id,
-            ownerId: d.ownerId,
-            name: d.name,
-            icon: d.icon,
-            parentId: d.parentId || '',
-            order: typeof d.order === 'number' ? d.order : 0,
-            createdAt: timestampToIso(d.createdAt),
-            updatedAt: timestampToIso(d.updatedAt),
-          };
-        });
-        setCategories(loadedCategories);
-        setCloudLoading(false);
-      },
-      (error) => {
-        setCloudLoading(false);
-        handleFirestoreError(error, OperationType.LIST, 'categories');
-      }
-    );
-
-    const unsubBookmarks = onSnapshot(
-      bookmarksQuery,
-      async (snapshot) => {
-        const demoBmDocs = snapshot.docs.filter(
-          (d) =>
-            DEMO_BOOKMARK_IDS.has(d.id) ||
-            DEMO_CATEGORY_IDS.has(d.data()?.categoryId)
-        );
-        if (demoBmDocs.length > 0) {
-          for (const demoDoc of demoBmDocs) {
-            try {
-              await deleteDoc(doc(db, 'bookmarks', demoDoc.id));
-            } catch {
-              // ignore
-            }
-          }
-        }
-
-        const loadedBookmarks: BookmarkItem[] = snapshot.docs
-          .filter(
-            (docSnap) =>
-              !DEMO_BOOKMARK_IDS.has(docSnap.id) &&
-              !DEMO_CATEGORY_IDS.has(docSnap.data()?.categoryId)
-          )
-          .map((docSnap) => {
-            const d = docSnap.data();
-            return {
-              id: docSnap.id,
-              ownerId: d.ownerId,
-              title: d.title,
-              url: d.url,
-              description: d.description || '',
-              categoryId: d.categoryId,
-              subcategoryId: d.subcategoryId || '',
-              isFavorite: Boolean(d.isFavorite),
-              createdAt: timestampToIso(d.createdAt),
-              updatedAt: timestampToIso(d.updatedAt),
-            };
-          });
-        setBookmarks(loadedBookmarks);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'bookmarks');
-      }
-    );
-
-    const unsubQuickShortcuts = onSnapshot(
-      quickShortcutsQuery,
-      async (snapshot) => {
-        const loadedShortcuts: QuickShortcutItem[] = snapshot.docs
-          .map((docSnap) => {
-            const d = docSnap.data();
-            return {
-              id: docSnap.id,
-              ownerId: d.ownerId,
-              title: d.title,
-              url: d.url,
-              iconType: (d.iconType as QuickShortcutIconType) || 'favicon',
-              customIcon: d.customIcon || '',
-              order: typeof d.order === 'number' ? d.order : 0,
-              createdAt: timestampToIso(d.createdAt),
-              updatedAt: timestampToIso(d.updatedAt),
-            };
-          })
-          .sort((a, b) => a.order - b.order);
-
-        setQuickShortcuts(loadedShortcuts);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'quickShortcuts');
-      }
-    );
-
-    const unsubSettings = onSnapshot(
-      settingsDocRef,
-      (docSnap) => {
-        if (docSnap.exists()) {
-          const d = docSnap.data();
+    apiClient
+      .getWorkspace()
+      .then((data) => {
+        if (cancelled) return;
+        setCategories(data.categories);
+        setBookmarks(data.bookmarks);
+        setQuickShortcuts(data.quickShortcuts);
+        setSharedCategories(data.sharedCategories);
+        if (data.settings) {
           setSettings((prev) => ({
-            ownerId: d.ownerId,
-            themeMode: prev.themeMode || 'dark',
-            primaryColor: d.primaryColor || 'blue',
-            glassIntensity: d.glassIntensity || 'balanced',
-            cardDensity: d.cardDensity || 'comfortable',
-            updatedAt: timestampToIso(d.updatedAt),
+            ...prev,
+            ownerId: data.settings!.ownerId,
+            themeMode: data.settings!.themeMode || prev.themeMode || 'dark',
+            primaryColor: data.settings!.primaryColor || 'blue',
+            glassIntensity: data.settings!.glassIntensity || 'balanced',
+            cardDensity: data.settings!.cardDensity || 'comfortable',
+            updatedAt: data.settings!.updatedAt,
           }));
         }
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.GET, `userSettings/${user.uid}`);
-      }
-    );
-
-    const sharedCategoriesQuery = query(
-      collection(db, 'sharedCategories'),
-      where('ownerId', '==', user.uid)
-    );
-
-    const unsubSharedCategories = onSnapshot(
-      sharedCategoriesQuery,
-      (snapshot) => {
-        const loaded: SharedCategoryRecord[] = snapshot.docs.map((docSnap) => {
-          const d = docSnap.data();
-          return {
-            id: docSnap.id,
-            ownerId: d.ownerId || user.uid,
-            categoryId: d.categoryId || '',
-            categoryName: d.categoryName || '',
-            categoryIcon: d.categoryIcon || 'bookmark',
-            isPublic: Boolean(d.isPublic),
-            subcategories: Array.isArray(d.subcategories) ? d.subcategories : [],
-            bookmarks: Array.isArray(d.bookmarks) ? d.bookmarks : [],
-            createdAt: timestampToIso(d.createdAt),
-            updatedAt: timestampToIso(d.updatedAt),
-          };
-        });
-        setSharedCategories(loaded);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'sharedCategories');
-      }
-    );
+        setCloudLoading(false);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setCloudLoading(false);
+        console.error('Failed to load PostgreSQL workspace:', error);
+        setLiveSyncToast('Could not load cloud workspace. Please refresh.');
+        setTimeout(() => setLiveSyncToast(null), 4000);
+      });
 
     return () => {
-      unsubCategories();
-      unsubBookmarks();
-      unsubQuickShortcuts();
-      unsubSettings();
-      unsubSharedCategories();
+      cancelled = true;
     };
   }, [authReady, user, syncGateStatus]);
 
@@ -793,232 +606,22 @@ export default function App() {
       localCategories,
       localBookmarks,
       localShortcuts,
-      cloudCategories,
-      cloudBookmarks,
-      cloudShortcuts,
     } = pendingSyncChoice;
 
     setIsSyncChoiceProcessing(true);
     setSyncChoiceError('');
 
-    const isCleanId = (id: string) => /^[a-zA-Z0-9_-]{1,128}$/.test(id);
-    const cleanIcon = (icon: string) =>
-      /^[a-zA-Z0-9_-]{1,40}$/.test(icon || '') ? icon : 'bookmark';
-
     try {
-      const catIdMap: Record<string, string> = {};
-      const existingCloudRootsByName = new Map<string, CategoryItem>();
-      const existingCloudSubsByKey = new Map<string, CategoryItem>();
+      const synced = await apiClient.syncLocalWorkspace({
+        categories: localCategories,
+        bookmarks: localBookmarks,
+        quickShortcuts: localShortcuts,
+      });
 
-      for (const cc of cloudCategories) {
-        if (cc.parentId === '') {
-          existingCloudRootsByName.set(cc.name.trim().toLowerCase(), cc);
-        }
-      }
-      for (const cc of cloudCategories) {
-        if (cc.parentId !== '') {
-          existingCloudSubsByKey.set(
-            `${cc.parentId}::${cc.name.trim().toLowerCase()}`,
-            cc
-          );
-        }
-      }
-
-      const localRoots = localCategories
-        .filter((c) => c.parentId === '')
-        .sort((a, b) => a.order - b.order);
-      const localSubs = localCategories
-        .filter((c) => c.parentId !== '')
-        .sort((a, b) => a.order - b.order);
-
-      // 1. Write Root Categories first so exists(parentId) passes for subcategories
-      let nextRootOrder = cloudCategories.filter((c) => c.parentId === '').length;
-      const rootWrites: { id: string; data: Record<string, unknown> }[] = [];
-      for (const root of localRoots) {
-        const match = existingCloudRootsByName.get(root.name.trim().toLowerCase());
-        if (match) {
-          catIdMap[root.id] = match.id;
-          continue;
-        }
-        const docId =
-          isCleanId(root.id) && !cloudCategories.some((c) => c.id === root.id)
-            ? root.id
-            : generateCleanId('cat');
-        catIdMap[root.id] = docId;
-        rootWrites.push({
-          id: docId,
-          data: {
-            ownerId: targetUser.uid,
-            name: root.name.trim().slice(0, 80) || 'Untitled',
-            icon: cleanIcon(root.icon),
-            parentId: '',
-            order: Math.min(100000, Math.max(0, nextRootOrder++)),
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          },
-        });
-      }
-
-      const CHUNK_SIZE = 450;
-      for (let i = 0; i < rootWrites.length; i += CHUNK_SIZE) {
-        const batch = writeBatch(db);
-        for (const item of rootWrites.slice(i, i + CHUNK_SIZE)) {
-          batch.set(doc(db, 'categories', item.id), item.data);
-        }
-        try {
-          await batch.commit();
-        } catch (error) {
-          handleFirestoreError(error, OperationType.WRITE, 'categories');
-        }
-      }
-
-      // 2. Write Subcategories after Root Categories exist
-      const subWrites: { id: string; data: Record<string, unknown> }[] = [];
-      for (const sub of localSubs) {
-        const mappedParentId = catIdMap[sub.parentId];
-        if (!mappedParentId) continue;
-        const match = existingCloudSubsByKey.get(
-          `${mappedParentId}::${sub.name.trim().toLowerCase()}`
-        );
-        if (match) {
-          catIdMap[sub.id] = match.id;
-          continue;
-        }
-        const docId =
-          isCleanId(sub.id) && !cloudCategories.some((c) => c.id === sub.id)
-            ? sub.id
-            : generateCleanId('sub');
-        catIdMap[sub.id] = docId;
-        subWrites.push({
-          id: docId,
-          data: {
-            ownerId: targetUser.uid,
-            name: sub.name.trim().slice(0, 80) || 'Subcategory',
-            icon: cleanIcon(sub.icon),
-            parentId: mappedParentId,
-            order: Math.min(100000, Math.max(0, sub.order || 0)),
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          },
-        });
-      }
-
-      for (let i = 0; i < subWrites.length; i += CHUNK_SIZE) {
-        const batch = writeBatch(db);
-        for (const item of subWrites.slice(i, i + CHUNK_SIZE)) {
-          batch.set(doc(db, 'categories', item.id), item.data);
-        }
-        try {
-          await batch.commit();
-        } catch (error) {
-          handleFirestoreError(error, OperationType.WRITE, 'categories');
-        }
-      }
-
-      // 3. Write Bookmarks & Quick Shortcuts (deduplicated by URL)
-      const existingUrls = new Set(
-        cloudBookmarks.map((b) => b.url.trim().toLowerCase())
-      );
-      const validCatIds = new Set([
-        ...cloudCategories.map((c) => c.id),
-        ...Object.values(catIdMap),
-      ]);
-
-      const bmWrites: { id: string; data: Record<string, unknown> }[] = [];
-      for (const bm of localBookmarks) {
-        const cleanUrl = bm.url.trim().slice(0, 500);
-        if (!/^https?:\/\/.+/i.test(cleanUrl)) continue;
-        if (existingUrls.has(cleanUrl.toLowerCase())) continue;
-
-        const mappedCatId = catIdMap[bm.categoryId] || bm.categoryId;
-        if (!validCatIds.has(mappedCatId)) continue;
-        const mappedSubId = bm.subcategoryId
-          ? catIdMap[bm.subcategoryId] || bm.subcategoryId
-          : '';
-        const safeSubId = mappedSubId && validCatIds.has(mappedSubId) ? mappedSubId : '';
-
-        existingUrls.add(cleanUrl.toLowerCase());
-        const bmDocId =
-          isCleanId(bm.id) && !cloudBookmarks.some((c) => c.id === bm.id)
-            ? bm.id
-            : generateCleanId('bm');
-
-        bmWrites.push({
-          id: bmDocId,
-          data: {
-            ownerId: targetUser.uid,
-            title: bm.title.trim().slice(0, 120) || cleanUrl.slice(0, 120),
-            url: cleanUrl,
-            description: (bm.description || '').slice(0, 400),
-            categoryId: mappedCatId,
-            subcategoryId: safeSubId,
-            isFavorite: Boolean(bm.isFavorite),
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          },
-        });
-      }
-
-      for (let i = 0; i < bmWrites.length; i += CHUNK_SIZE) {
-        const batch = writeBatch(db);
-        for (const item of bmWrites.slice(i, i + CHUNK_SIZE)) {
-          batch.set(doc(db, 'bookmarks', item.id), item.data);
-        }
-        try {
-          await batch.commit();
-        } catch (error) {
-          handleFirestoreError(error, OperationType.WRITE, 'bookmarks');
-        }
-      }
-
-      const existingShortcutUrls = new Set(
-        cloudShortcuts.map((s) => s.url.trim().toLowerCase())
-      );
-      let nextShortcutOrder = cloudShortcuts.length;
-      const scWrites: { id: string; data: Record<string, unknown> }[] = [];
-      for (const sc of localShortcuts) {
-        const cleanUrl = sc.url.trim().slice(0, 500);
-        if (!/^https?:\/\/.+/i.test(cleanUrl)) continue;
-        if (existingShortcutUrls.has(cleanUrl.toLowerCase())) continue;
-        existingShortcutUrls.add(cleanUrl.toLowerCase());
-
-        const scDocId =
-          isCleanId(sc.id) && !cloudShortcuts.some((c) => c.id === sc.id)
-            ? sc.id
-            : generateCleanId('qs');
-        const iconType =
-          sc.iconType === 'lucide' || sc.iconType === 'custom'
-            ? sc.iconType
-            : 'favicon';
-        const customIcon =
-          iconType === 'favicon' ? '' : (sc.customIcon || '').trim().slice(0, 500);
-
-        scWrites.push({
-          id: scDocId,
-          data: {
-            ownerId: targetUser.uid,
-            title: sc.title.trim().slice(0, 80) || 'Shortcut',
-            url: cleanUrl,
-            iconType,
-            customIcon,
-            order: Math.min(100000, Math.max(0, nextShortcutOrder++)),
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          },
-        });
-      }
-
-      for (let i = 0; i < scWrites.length; i += CHUNK_SIZE) {
-        const batch = writeBatch(db);
-        for (const item of scWrites.slice(i, i + CHUNK_SIZE)) {
-          batch.set(doc(db, 'quickShortcuts', item.id), item.data);
-        }
-        try {
-          await batch.commit();
-        } catch (error) {
-          handleFirestoreError(error, OperationType.WRITE, 'quickShortcuts');
-        }
-      }
+      setCategories(synced.categories);
+      setBookmarks(synced.bookmarks);
+      setQuickShortcuts(synced.quickShortcuts);
+      setSharedCategories(synced.sharedCategories);
 
       try {
         localStorage.setItem(STORAGE_KEYS.CLOUD_LINKED_UID, targetUser.uid);
@@ -1099,46 +702,7 @@ export default function App() {
     setSyncChoiceError('');
 
     try {
-      const [scSnap, bmSnap, catSnap, shareSnap] = await Promise.all([
-        getDocs(
-          query(collection(db, 'quickShortcuts'), where('ownerId', '==', targetUser.uid))
-        ),
-        getDocs(
-          query(collection(db, 'bookmarks'), where('ownerId', '==', targetUser.uid))
-        ),
-        getDocs(
-          query(collection(db, 'categories'), where('ownerId', '==', targetUser.uid))
-        ),
-        getDocs(
-          query(collection(db, 'sharedCategories'), where('ownerId', '==', targetUser.uid))
-        ),
-      ]);
-
-      const deleteRefs = [
-        ...scSnap.docs.map((d) => ({ ref: d.ref, col: 'quickShortcuts' })),
-        ...bmSnap.docs.map((d) => ({ ref: d.ref, col: 'bookmarks' })),
-        ...shareSnap.docs.map((d) => ({ ref: d.ref, col: 'sharedCategories' })),
-        ...catSnap.docs
-          .filter((d) => Boolean(d.data()?.parentId))
-          .map((d) => ({ ref: d.ref, col: 'categories' })),
-        ...catSnap.docs
-          .filter((d) => !d.data()?.parentId)
-          .map((d) => ({ ref: d.ref, col: 'categories' })),
-      ];
-
-      const CHUNK_SIZE = 450;
-      for (let i = 0; i < deleteRefs.length; i += CHUNK_SIZE) {
-        const chunk = deleteRefs.slice(i, i + CHUNK_SIZE);
-        const batch = writeBatch(db);
-        for (const item of chunk) {
-          batch.delete(item.ref);
-        }
-        try {
-          await batch.commit();
-        } catch (error) {
-          handleFirestoreError(error, OperationType.DELETE, chunk[0]?.col || 'bookmarks');
-        }
-      }
+      await apiClient.clearWorkspace();
 
       setCategories([]);
       setBookmarks([]);
@@ -1269,43 +833,11 @@ export default function App() {
   // Clear Entire Workspace (Categories, Subcategories, Bookmarks, and Quick Shortcuts)
   const handleClearEntireWorkspace = async () => {
     if (user) {
-      for (const sc of quickShortcuts) {
-        try {
-          await deleteDoc(doc(db, 'quickShortcuts', sc.id));
-        } catch (error) {
-          handleFirestoreError(error, OperationType.DELETE, `quickShortcuts/${sc.id}`);
-        }
-      }
-      for (const bm of bookmarks) {
-        try {
-          await deleteDoc(doc(db, 'bookmarks', bm.id));
-        } catch (error) {
-          handleFirestoreError(error, OperationType.DELETE, `bookmarks/${bm.id}`);
-        }
-      }
-      const subs = categories.filter((c) => c.parentId !== '');
-      for (const sub of subs) {
-        try {
-          await deleteDoc(doc(db, 'categories', sub.id));
-        } catch (error) {
-          handleFirestoreError(error, OperationType.DELETE, `categories/${sub.id}`);
-        }
-      }
-      const roots = categories.filter((c) => c.parentId === '');
-      for (const root of roots) {
-        try {
-          await deleteDoc(doc(db, 'categories', root.id));
-        } catch (error) {
-          handleFirestoreError(error, OperationType.DELETE, `categories/${root.id}`);
-        }
-      }
-      for (const sc of sharedCategories) {
-        try {
-          await deleteDoc(doc(db, 'sharedCategories', sc.id));
-        } catch (error) {
-          handleFirestoreError(error, OperationType.DELETE, `sharedCategories/${sc.id}`);
-        }
-      }
+      await apiClient.clearWorkspace();
+      setQuickShortcuts([]);
+      setBookmarks([]);
+      setCategories([]);
+      setSharedCategories([]);
     } else {
       setQuickShortcuts([]);
       setBookmarks([]);
@@ -1368,85 +900,93 @@ export default function App() {
       }
     };
 
-    if (replaceAllExisting) {
-      emitProgress('preparing', 'Clearing previous bookmarks...');
-      await handleClearEntireWorkspace();
+    if (user) {
+      emitProgress(
+        'categories',
+        replaceAllExisting ? 'Replacing workspace...' : 'Syncing folders and bookmarks...'
+      );
+      const { summary, workspace } = await apiClient.importChromePlan(
+        plan,
+        replaceAllExisting
+      );
+      setCategories(workspace.categories);
+      setBookmarks(workspace.bookmarks);
+      setQuickShortcuts(workspace.quickShortcuts);
+      setSharedCategories(workspace.sharedCategories);
+
+      addedCatCount = summary.addedCategories;
+      addedBmCount = summary.addedBookmarks;
+      skippedDupCount = summary.skippedDuplicates;
+
+      const expandedMap: Record<string, boolean> = {};
+      for (const catId of summary.expandedCategoryIds) {
+        expandedMap[catId] = true;
+      }
+      setExpandedCategories((prev) => ({ ...prev, ...expandedMap }));
     } else {
-      emitProgress('categories', 'Scanning existing categories...');
-    }
-
-    const existingRootsByName = new Map<string, CategoryItem>();
-    const existingSubsByParentAndName = new Map<string, CategoryItem>();
-    const existingBookmarkUrls = new Set<string>();
-
-    if (!replaceAllExisting) {
-      for (const c of categories) {
-        if (c.parentId === '') {
-          existingRootsByName.set(c.name.trim().toLowerCase(), c);
-        }
-      }
-      for (const c of categories) {
-        if (c.parentId !== '') {
-          existingSubsByParentAndName.set(
-            `${c.parentId}::${c.name.trim().toLowerCase()}`,
-            c
-          );
-        }
-      }
-      for (const b of bookmarks) {
-        existingBookmarkUrls.add(b.url.trim().toLowerCase());
-      }
-    }
-
-    const baseTimeMs = Date.now();
-    const tempToRealId: Record<string, string> = {};
-    const newLocalCategories: CategoryItem[] = [];
-    const newLocalBookmarks: BookmarkItem[] = [];
-    const expandedMap: Record<string, boolean> = {};
-
-    // 1. Create or Match Root Categories in exact order
-    let nextRootOrder = replaceAllExisting
-      ? 0
-      : categories.filter((c) => c.parentId === '').length;
-
-    for (let i = 0; i < rootCats.length; i++) {
-      const rc = rootCats[i];
-      processedCount++;
-      emitProgress('categories', rc.name);
-      await tickVisualFrame(2, i);
-
-      const existingMatch = !replaceAllExisting
-        ? existingRootsByName.get(rc.name.trim().toLowerCase())
-        : undefined;
-
-      if (existingMatch) {
-        tempToRealId[rc.tempId] = existingMatch.id;
-        expandedMap[existingMatch.id] = true;
-        continue;
-      }
-
-      const realId = generateCleanId(`cat_${i}`);
-      tempToRealId[rc.tempId] = realId;
-      expandedMap[realId] = true;
-      addedCatCount++;
-      const iso = new Date(baseTimeMs + i * 10).toISOString();
-      const orderVal = replaceAllExisting ? i : nextRootOrder++;
-
-      if (user) {
-        try {
-          await setDoc(doc(db, 'categories', realId), {
-            ownerId: user.uid,
-            name: rc.name.slice(0, 80),
-            icon: rc.icon || 'bookmark',
-            parentId: '',
-            order: orderVal,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
-        } catch (error) {
-          handleFirestoreError(error, OperationType.CREATE, `categories/${realId}`);
-        }
+      if (replaceAllExisting) {
+        emitProgress('preparing', 'Clearing previous bookmarks...');
+        await handleClearEntireWorkspace();
       } else {
+        emitProgress('categories', 'Scanning existing categories...');
+      }
+
+      const existingRootsByName = new Map<string, CategoryItem>();
+      const existingSubsByParentAndName = new Map<string, CategoryItem>();
+      const existingBookmarkUrls = new Set<string>();
+
+      if (!replaceAllExisting) {
+        for (const c of categories) {
+          if (c.parentId === '') {
+            existingRootsByName.set(c.name.trim().toLowerCase(), c);
+          }
+        }
+        for (const c of categories) {
+          if (c.parentId !== '') {
+            existingSubsByParentAndName.set(
+              `${c.parentId}::${c.name.trim().toLowerCase()}`,
+              c
+            );
+          }
+        }
+        for (const b of bookmarks) {
+          existingBookmarkUrls.add(b.url.trim().toLowerCase());
+        }
+      }
+
+      const baseTimeMs = Date.now();
+      const tempToRealId: Record<string, string> = {};
+      const newLocalCategories: CategoryItem[] = [];
+      const newLocalBookmarks: BookmarkItem[] = [];
+      const expandedMap: Record<string, boolean> = {};
+
+      let nextRootOrder = replaceAllExisting
+        ? 0
+        : categories.filter((c) => c.parentId === '').length;
+
+      for (let i = 0; i < rootCats.length; i++) {
+        const rc = rootCats[i];
+        processedCount++;
+        emitProgress('categories', rc.name);
+        await tickVisualFrame(2, i);
+
+        const existingMatch = !replaceAllExisting
+          ? existingRootsByName.get(rc.name.trim().toLowerCase())
+          : undefined;
+
+        if (existingMatch) {
+          tempToRealId[rc.tempId] = existingMatch.id;
+          expandedMap[existingMatch.id] = true;
+          continue;
+        }
+
+        const realId = generateCleanId(`cat_${i}`);
+        tempToRealId[rc.tempId] = realId;
+        expandedMap[realId] = true;
+        addedCatCount++;
+        const iso = new Date(baseTimeMs + i * 10).toISOString();
+        const orderVal = replaceAllExisting ? i : nextRootOrder++;
+
         newLocalCategories.push({
           id: realId,
           ownerId: 'local',
@@ -1458,53 +998,32 @@ export default function App() {
           updatedAt: iso,
         });
       }
-    }
 
-    // 2. Create or Match Subcategories in exact order under their parent Root Categories
-    for (let i = 0; i < subCats.length; i++) {
-      const sc = subCats[i];
-      processedCount++;
-      emitProgress('categories', sc.name);
-      await tickVisualFrame(3, i);
+      for (let i = 0; i < subCats.length; i++) {
+        const sc = subCats[i];
+        processedCount++;
+        emitProgress('categories', sc.name);
+        await tickVisualFrame(3, i);
 
-      const parentRealId = tempToRealId[sc.parentTempId];
-      if (!parentRealId) continue;
+        const parentRealId = tempToRealId[sc.parentTempId];
+        if (!parentRealId) continue;
 
-      const existingSubMatch = !replaceAllExisting
-        ? existingSubsByParentAndName.get(
-            `${parentRealId}::${sc.name.trim().toLowerCase()}`
-          )
-        : undefined;
+        const existingSubMatch = !replaceAllExisting
+          ? existingSubsByParentAndName.get(
+              `${parentRealId}::${sc.name.trim().toLowerCase()}`
+            )
+          : undefined;
 
-      if (existingSubMatch) {
-        tempToRealId[sc.tempId] = existingSubMatch.id;
-        continue;
-      }
-
-      const realSubId = generateCleanId(`sub_${i}`);
-      tempToRealId[sc.tempId] = realSubId;
-      addedCatCount++;
-      const iso = new Date(baseTimeMs + 1000 + i * 10).toISOString();
-
-      if (user) {
-        try {
-          await setDoc(doc(db, 'categories', realSubId), {
-            ownerId: user.uid,
-            name: sc.name.slice(0, 80),
-            icon: sc.icon || 'bookmark',
-            parentId: parentRealId,
-            order: sc.order,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
-        } catch (error) {
-          handleFirestoreError(
-            error,
-            OperationType.CREATE,
-            `categories/${realSubId}`
-          );
+        if (existingSubMatch) {
+          tempToRealId[sc.tempId] = existingSubMatch.id;
+          continue;
         }
-      } else {
+
+        const realSubId = generateCleanId(`sub_${i}`);
+        tempToRealId[sc.tempId] = realSubId;
+        addedCatCount++;
+        const iso = new Date(baseTimeMs + 1000 + i * 10).toISOString();
+
         newLocalCategories.push({
           id: realSubId,
           ownerId: 'local',
@@ -1516,61 +1035,41 @@ export default function App() {
           updatedAt: iso,
         });
       }
-    }
 
-    // 3. Create Bookmarks in exact order (skipping duplicates when merging)
-    const localTickStride =
-      orderedBookmarks.length > 180 ? 6 : orderedBookmarks.length > 60 ? 3 : 1;
+      const localTickStride =
+        orderedBookmarks.length > 180 ? 6 : orderedBookmarks.length > 60 ? 3 : 1;
 
-    for (let i = 0; i < orderedBookmarks.length; i++) {
-      const bm = orderedBookmarks[i];
-      processedCount++;
-      const normalizedUrl = bm.url.trim().toLowerCase();
-      if (!replaceAllExisting && existingBookmarkUrls.has(normalizedUrl)) {
-        skippedDupCount++;
-        emitProgress('bookmarks', bm.title);
-        await tickVisualFrame(localTickStride * 2, i);
-        continue;
-      }
-      existingBookmarkUrls.add(normalizedUrl);
-
-      const realCatId = tempToRealId[bm.categoryTempId];
-      if (!realCatId) continue;
-      const realSubId = bm.subcategoryTempId
-        ? tempToRealId[bm.subcategoryTempId] || ''
-        : '';
-
-      const bmId = generateCleanId(`bm_${String(i).padStart(4, '0')}`);
-      const iso = new Date(baseTimeMs + 5000 + i * 10).toISOString();
-      const desc = '';
-      addedBmCount++;
-
-      emitProgress('bookmarks', bm.title);
-      await tickVisualFrame(localTickStride, i);
-
-      if (user) {
-        try {
-          await setDoc(doc(db, 'bookmarks', bmId), {
-            ownerId: user.uid,
-            title: bm.title.slice(0, 120),
-            url: bm.url.slice(0, 500),
-            description: desc.slice(0, 400),
-            categoryId: realCatId,
-            subcategoryId: realSubId,
-            isFavorite: false,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
-        } catch (error) {
-          handleFirestoreError(error, OperationType.CREATE, `bookmarks/${bmId}`);
+      for (let i = 0; i < orderedBookmarks.length; i++) {
+        const bm = orderedBookmarks[i];
+        processedCount++;
+        const normalizedUrl = bm.url.trim().toLowerCase();
+        if (!replaceAllExisting && existingBookmarkUrls.has(normalizedUrl)) {
+          skippedDupCount++;
+          emitProgress('bookmarks', bm.title);
+          await tickVisualFrame(localTickStride * 2, i);
+          continue;
         }
-      } else {
+        existingBookmarkUrls.add(normalizedUrl);
+
+        const realCatId = tempToRealId[bm.categoryTempId];
+        if (!realCatId) continue;
+        const realSubId = bm.subcategoryTempId
+          ? tempToRealId[bm.subcategoryTempId] || ''
+          : '';
+
+        const bmId = generateCleanId(`bm_${String(i).padStart(4, '0')}`);
+        const iso = new Date(baseTimeMs + 5000 + i * 10).toISOString();
+        addedBmCount++;
+
+        emitProgress('bookmarks', bm.title);
+        await tickVisualFrame(localTickStride, i);
+
         newLocalBookmarks.push({
           id: bmId,
           ownerId: 'local',
           title: bm.title.slice(0, 120),
           url: bm.url.slice(0, 500),
-          description: desc.slice(0, 400),
+          description: '',
           categoryId: realCatId,
           subcategoryId: realSubId,
           isFavorite: false,
@@ -1578,11 +1077,8 @@ export default function App() {
           updatedAt: iso,
         });
       }
-    }
 
-    setExpandedCategories((prev) => ({ ...prev, ...expandedMap }));
-
-    if (!user) {
+      setExpandedCategories((prev) => ({ ...prev, ...expandedMap }));
       setCategories((prev) =>
         replaceAllExisting ? newLocalCategories : [...prev, ...newLocalCategories]
       );
@@ -1613,7 +1109,7 @@ export default function App() {
       // ignore
     }
 
-    if (addedBmCount > 0 || newLocalCategories.length > 0) {
+    if (addedBmCount > 0 || addedCatCount > 0) {
       setLiveSyncToast(
         `Synced ${addedBmCount} new Chrome ${
           addedBmCount === 1 ? 'bookmark' : 'bookmarks'
@@ -1868,38 +1364,20 @@ export default function App() {
     const docId = isExisting && data.id ? data.id : generateCleanId('bm');
 
     if (user) {
-      const path = `bookmarks/${docId}`;
-      try {
-        if (isExisting) {
-          await updateDoc(doc(db, 'bookmarks', docId), {
-            title: data.title.slice(0, 120),
-            url: data.url.slice(0, 500),
-            description: data.description.slice(0, 400),
-            categoryId: data.categoryId,
-            subcategoryId: data.subcategoryId || '',
-            isFavorite: Boolean(data.isFavorite),
-            updatedAt: serverTimestamp(),
-          });
-        } else {
-          await setDoc(doc(db, 'bookmarks', docId), {
-            ownerId: user.uid,
-            title: data.title.slice(0, 120),
-            url: data.url.slice(0, 500),
-            description: data.description.slice(0, 400),
-            categoryId: data.categoryId,
-            subcategoryId: data.subcategoryId || '',
-            isFavorite: Boolean(data.isFavorite),
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
-        }
-      } catch (error) {
-        handleFirestoreError(
-          error,
-          isExisting ? OperationType.UPDATE : OperationType.CREATE,
-          path
-        );
-      }
+      const saved = await apiClient.saveBookmark({
+        id: isExisting ? docId : undefined,
+        title: data.title.slice(0, 120),
+        url: data.url.slice(0, 500),
+        description: data.description.slice(0, 400),
+        categoryId: data.categoryId,
+        subcategoryId: data.subcategoryId || '',
+        isFavorite: Boolean(data.isFavorite),
+      });
+      setBookmarks((prev) =>
+        isExisting
+          ? prev.map((item) => (item.id === saved.id ? saved : item))
+          : [...prev, saved]
+      );
     } else {
       if (isExisting) {
         setBookmarks((prev) =>
@@ -1938,36 +1416,24 @@ export default function App() {
 
   const handleToggleFavorite = async (bm: BookmarkItem) => {
     const nextVal = !bm.isFavorite;
+    const nowIso = new Date().toISOString();
+    setBookmarks((prev) =>
+      prev.map((item) =>
+        item.id === bm.id
+          ? { ...item, isFavorite: nextVal, updatedAt: nowIso }
+          : item
+      )
+    );
     if (user) {
-      try {
-        await updateDoc(doc(db, 'bookmarks', bm.id), {
-          isFavorite: nextVal,
-          updatedAt: serverTimestamp(),
-        });
-      } catch (error) {
-        handleFirestoreError(error, OperationType.UPDATE, `bookmarks/${bm.id}`);
-      }
-    } else {
-      setBookmarks((prev) =>
-        prev.map((item) =>
-          item.id === bm.id
-            ? { ...item, isFavorite: nextVal, updatedAt: new Date().toISOString() }
-            : item
-        )
-      );
+      await apiClient.toggleFavorite(bm.id, nextVal);
     }
   };
 
   const handleDeleteBookmark = async (id: string) => {
     if (user) {
-      try {
-        await deleteDoc(doc(db, 'bookmarks', id));
-      } catch (error) {
-        handleFirestoreError(error, OperationType.DELETE, `bookmarks/${id}`);
-      }
-    } else {
-      setBookmarks((prev) => prev.filter((item) => item.id !== id));
+      await apiClient.deleteBookmark(id);
     }
+    setBookmarks((prev) => prev.filter((item) => item.id !== id));
     setSelectedBookmarkIds((prev) => prev.filter((selId) => selId !== id));
   };
 
@@ -2002,53 +1468,33 @@ export default function App() {
 
     try {
       if (user) {
-        const CHUNK_SIZE = 450;
-        for (let i = 0; i < bookmarkIds.length; i += CHUNK_SIZE) {
-          const chunk = bookmarkIds.slice(i, i + CHUNK_SIZE);
-          const batch = writeBatch(db);
-          for (const id of chunk) {
-            const payload: Record<string, unknown> = {
-              updatedAt: serverTimestamp(),
-            };
-            if (updates.category) {
-              payload.categoryId = updates.category.categoryId;
-              payload.subcategoryId = updates.category.subcategoryId || '';
-            }
-            if (updates.favoriteStatus === 'favorite') {
-              payload.isFavorite = true;
-            } else if (updates.favoriteStatus === 'unfavorite') {
-              payload.isFavorite = false;
-            }
-            batch.update(doc(db, 'bookmarks', id), payload);
-          }
-          try {
-            await batch.commit();
-          } catch (error) {
-            handleFirestoreError(error, OperationType.UPDATE, 'bookmarks');
-          }
-        }
-      } else {
-        setBookmarks((prev) =>
-          prev.map((bm) => {
-            if (!idSet.has(bm.id)) return bm;
-            return {
-              ...bm,
-              ...(updates.category
-                ? {
-                    categoryId: updates.category.categoryId,
-                    subcategoryId: updates.category.subcategoryId || '',
-                  }
-                : {}),
-              ...(updates.favoriteStatus === 'favorite'
-                ? { isFavorite: true }
-                : updates.favoriteStatus === 'unfavorite'
-                ? { isFavorite: false }
-                : {}),
-              updatedAt: nowIso,
-            };
-          })
-        );
+        await apiClient.batchEditBookmarks({
+          bookmarkIds,
+          category: updates.category,
+          favoriteStatus: updates.favoriteStatus || 'keep',
+        });
       }
+
+      setBookmarks((prev) =>
+        prev.map((bm) => {
+          if (!idSet.has(bm.id)) return bm;
+          return {
+            ...bm,
+            ...(updates.category
+              ? {
+                  categoryId: updates.category.categoryId,
+                  subcategoryId: updates.category.subcategoryId || '',
+                }
+              : {}),
+            ...(updates.favoriteStatus === 'favorite'
+              ? { isFavorite: true }
+              : updates.favoriteStatus === 'unfavorite'
+              ? { isFavorite: false }
+              : {}),
+            updatedAt: nowIso,
+          };
+        })
+      );
 
       const parts: string[] = [];
       if (updates.category) {
@@ -2089,22 +1535,9 @@ export default function App() {
 
     try {
       if (user) {
-        const CHUNK_SIZE = 450;
-        for (let i = 0; i < idsToDelete.length; i += CHUNK_SIZE) {
-          const chunk = idsToDelete.slice(i, i + CHUNK_SIZE);
-          const batch = writeBatch(db);
-          for (const id of chunk) {
-            batch.delete(doc(db, 'bookmarks', id));
-          }
-          try {
-            await batch.commit();
-          } catch (error) {
-            handleFirestoreError(error, OperationType.DELETE, 'bookmarks');
-          }
-        }
-      } else {
-        setBookmarks((prev) => prev.filter((item) => !idSet.has(item.id)));
+        await apiClient.batchDeleteBookmarks(idsToDelete);
       }
+      setBookmarks((prev) => prev.filter((item) => !idSet.has(item.id)));
       setSelectedBookmarkIds([]);
       setConfirmBulkDelete(false);
       setBulkMode(false);
@@ -2132,36 +1565,18 @@ export default function App() {
       data.iconType === 'favicon' ? '' : data.customIcon.trim().slice(0, 500);
 
     if (user) {
-      const path = `quickShortcuts/${docId}`;
-      try {
-        if (isExisting) {
-          await updateDoc(doc(db, 'quickShortcuts', docId), {
-            title: cleanTitle,
-            url: cleanUrl,
-            iconType: data.iconType,
-            customIcon: cleanCustomIcon,
-            updatedAt: serverTimestamp(),
-          });
-        } else {
-          const nextOrder = quickShortcuts.length;
-          await setDoc(doc(db, 'quickShortcuts', docId), {
-            ownerId: user.uid,
-            title: cleanTitle,
-            url: cleanUrl,
-            iconType: data.iconType,
-            customIcon: cleanCustomIcon,
-            order: nextOrder,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
-        }
-      } catch (error) {
-        handleFirestoreError(
-          error,
-          isExisting ? OperationType.UPDATE : OperationType.CREATE,
-          path
-        );
-      }
+      const saved = await apiClient.saveQuickShortcut({
+        id: isExisting ? docId : undefined,
+        title: cleanTitle,
+        url: cleanUrl,
+        iconType: data.iconType,
+        customIcon: cleanCustomIcon,
+      });
+      setQuickShortcuts((prev) =>
+        isExisting
+          ? prev.map((item) => (item.id === saved.id ? saved : item))
+          : [...prev, saved]
+      );
     } else {
       if (isExisting) {
         setQuickShortcuts((prev) =>
@@ -2197,18 +1612,13 @@ export default function App() {
 
   const handleDeleteQuickShortcut = async (id: string) => {
     if (user) {
-      try {
-        await deleteDoc(doc(db, 'quickShortcuts', id));
-      } catch (error) {
-        handleFirestoreError(error, OperationType.DELETE, `quickShortcuts/${id}`);
-      }
-    } else {
-      setQuickShortcuts((prev) =>
-        prev
-          .filter((item) => item.id !== id)
-          .map((item, idx) => ({ ...item, order: idx }))
-      );
+      await apiClient.deleteQuickShortcut(id);
     }
+    setQuickShortcuts((prev) =>
+      prev
+        .filter((item) => item.id !== id)
+        .map((item, idx) => ({ ...item, order: idx }))
+    );
   };
 
   const handleToggleBookmarkShortcut = async (bm: BookmarkItem) => {
@@ -2240,18 +1650,7 @@ export default function App() {
     setQuickShortcuts(reindexed);
 
     if (user) {
-      try {
-        const batch = writeBatch(db);
-        for (const sc of reindexed) {
-          batch.update(doc(db, 'quickShortcuts', sc.id), {
-            order: sc.order,
-            updatedAt: serverTimestamp(),
-          });
-        }
-        await batch.commit();
-      } catch (error) {
-        handleFirestoreError(error, OperationType.UPDATE, 'quickShortcuts');
-      }
+      await apiClient.reorderQuickShortcuts(reindexed.map((s) => s.id));
     }
   };
 
@@ -2269,20 +1668,16 @@ export default function App() {
     const nowIso = new Date().toISOString();
     const resolvedIcon = icon || inferIconForFolderName(cleanName);
 
+    let createdId = newId;
     if (user) {
-      try {
-        await setDoc(doc(db, 'categories', newId), {
-          ownerId: user.uid,
-          name: cleanName,
-          icon: resolvedIcon,
-          parentId: parentId || '',
-          order: nextOrder,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      } catch (error) {
-        handleFirestoreError(error, OperationType.CREATE, `categories/${newId}`);
-      }
+      const created = await apiClient.createCategory({
+        id: newId,
+        name: cleanName,
+        icon: resolvedIcon,
+        parentId: parentId || '',
+      });
+      createdId = created.id;
+      setCategories((prev) => [...prev, created]);
     } else {
       const newCat: CategoryItem = {
         id: newId,
@@ -2300,7 +1695,7 @@ export default function App() {
     if (parentId) {
       setExpandedCategories((prev) => ({ ...prev, [parentId]: true }));
     }
-    return newId;
+    return createdId;
   };
 
   const handleUpdateCategory = async (id: string, name: string, icon: string) => {
@@ -2309,24 +1704,15 @@ export default function App() {
     const safeIcon = /^[a-zA-Z0-9_-]{1,40}$/.test(icon) ? icon : 'bookmark';
 
     if (user) {
-      try {
-        await updateDoc(doc(db, 'categories', id), {
-          name: cleanName,
-          icon: safeIcon,
-          updatedAt: serverTimestamp(),
-        });
-      } catch (error) {
-        handleFirestoreError(error, OperationType.UPDATE, `categories/${id}`);
-      }
-    } else {
-      setCategories((prev) =>
-        prev.map((c) =>
-          c.id === id
-            ? { ...c, name: cleanName, icon: safeIcon, updatedAt: new Date().toISOString() }
-            : c
-        )
-      );
+      await apiClient.updateCategory(id, { name: cleanName, icon: safeIcon });
     }
+    setCategories((prev) =>
+      prev.map((c) =>
+        c.id === id
+          ? { ...c, name: cleanName, icon: safeIcon, updatedAt: new Date().toISOString() }
+          : c
+      )
+    );
   };
 
   const handleDeleteCategory = async (id: string, fallbackCategoryId?: string) => {
@@ -2334,64 +1720,32 @@ export default function App() {
     if (!target) return;
 
     const isRoot = target.parentId === '';
-    const childSubIds = isRoot
-      ? categories.filter((c) => c.parentId === id).map((c) => c.id)
-      : [];
-
     if (user) {
-      try {
-        if (isRoot) {
-          const affectedBookmarks = bookmarks.filter((b) => b.categoryId === id);
-          for (const bm of affectedBookmarks) {
-            if (fallbackCategoryId) {
-              await updateDoc(doc(db, 'bookmarks', bm.id), {
-                categoryId: fallbackCategoryId,
-                subcategoryId: '',
-                updatedAt: serverTimestamp(),
-              });
-            } else {
-              await deleteDoc(doc(db, 'bookmarks', bm.id));
-            }
-          }
-          for (const subId of childSubIds) {
-            await deleteDoc(doc(db, 'categories', subId));
-          }
-        } else {
-          const affectedBookmarks = bookmarks.filter((b) => b.subcategoryId === id);
-          for (const bm of affectedBookmarks) {
-            await updateDoc(doc(db, 'bookmarks', bm.id), {
-              subcategoryId: '',
-              updatedAt: serverTimestamp(),
-            });
-          }
-        }
-        await deleteDoc(doc(db, 'categories', id));
-        if (isRoot && sharedByCategoryId[id]) {
-          await deleteDoc(doc(db, 'sharedCategories', sharedByCategoryId[id].id));
-        }
-      } catch (error) {
-        handleFirestoreError(error, OperationType.DELETE, `categories/${id}`);
+      await apiClient.deleteCategory(id, fallbackCategoryId);
+      if (isRoot && sharedByCategoryId[id]) {
+        const shareToDelete = sharedByCategoryId[id].id;
+        setSharedCategories((prev) => prev.filter((s) => s.id !== shareToDelete));
       }
+    }
+
+    if (isRoot) {
+      setBookmarks((prev) =>
+        fallbackCategoryId
+          ? prev.map((b) =>
+              b.categoryId === id
+                ? { ...b, categoryId: fallbackCategoryId, subcategoryId: '' }
+                : b
+            )
+          : prev.filter((b) => b.categoryId !== id)
+      );
+      setCategories((prev) =>
+        prev.filter((c) => c.id !== id && c.parentId !== id)
+      );
     } else {
-      if (isRoot) {
-        setBookmarks((prev) =>
-          fallbackCategoryId
-            ? prev.map((b) =>
-                b.categoryId === id
-                  ? { ...b, categoryId: fallbackCategoryId, subcategoryId: '' }
-                  : b
-              )
-            : prev.filter((b) => b.categoryId !== id)
-        );
-        setCategories((prev) =>
-          prev.filter((c) => c.id !== id && c.parentId !== id)
-        );
-      } else {
-        setBookmarks((prev) =>
-          prev.map((b) => (b.subcategoryId === id ? { ...b, subcategoryId: '' } : b))
-        );
-        setCategories((prev) => prev.filter((c) => c.id !== id));
-      }
+      setBookmarks((prev) =>
+        prev.map((b) => (b.subcategoryId === id ? { ...b, subcategoryId: '' } : b))
+      );
+      setCategories((prev) => prev.filter((c) => c.id !== id));
     }
 
     if (selectedCategoryId === id) {
@@ -2413,17 +1767,12 @@ export default function App() {
     setSettings(nextSettings);
 
     if (user) {
-      try {
-        await setDoc(doc(db, 'userSettings', user.uid), {
-          ownerId: user.uid,
-          primaryColor: nextSettings.primaryColor.slice(0, 32),
-          glassIntensity: nextSettings.glassIntensity,
-          cardDensity: nextSettings.cardDensity,
-          updatedAt: serverTimestamp(),
-        });
-      } catch (error) {
-        handleFirestoreError(error, OperationType.WRITE, `userSettings/${user.uid}`);
-      }
+      await apiClient.updateSettings({
+        themeMode: nextSettings.themeMode || 'dark',
+        primaryColor: nextSettings.primaryColor.slice(0, 32),
+        glassIntensity: nextSettings.glassIntensity,
+        cardDensity: nextSettings.cardDensity,
+      });
     }
   };
 
@@ -2473,87 +1822,35 @@ export default function App() {
       }));
 
     const existing = sharedByCategoryId[category.id];
-    const nowIso = new Date().toISOString();
-
-    if (existing) {
-      try {
-        await updateDoc(doc(db, 'sharedCategories', existing.id), {
-          categoryName: safeCatName,
-          categoryIcon: safeCatIcon,
-          isPublic: true,
-          subcategories: childSubs,
-          bookmarks: catBookmarks,
-          updatedAt: serverTimestamp(),
-        });
-      } catch (error) {
-        handleFirestoreError(
-          error,
-          OperationType.UPDATE,
-          `sharedCategories/${existing.id}`
-        );
-      }
-      return {
-        ...existing,
-        categoryName: safeCatName,
-        categoryIcon: safeCatIcon,
-        isPublic: true,
-        subcategories: childSubs,
-        bookmarks: catBookmarks,
-        updatedAt: nowIso,
-      };
-    }
-
-    const newShareId = generateCleanId('share');
-    try {
-      await setDoc(doc(db, 'sharedCategories', newShareId), {
-        ownerId: user.uid,
-        categoryId: category.id,
-        categoryName: safeCatName,
-        categoryIcon: safeCatIcon,
-        isPublic: true,
-        subcategories: childSubs,
-        bookmarks: catBookmarks,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    } catch (error) {
-      handleFirestoreError(
-        error,
-        OperationType.WRITE,
-        `sharedCategories/${newShareId}`
-      );
-    }
-
-    trackEvent('share_category', {
-      category_id: category.id,
-      bookmark_count: catBookmarks.length,
-    });
-
-    return {
-      id: newShareId,
-      ownerId: user.uid,
+    const saved = await apiClient.publishOrUpdateShare({
+      existingShareId: existing?.id,
       categoryId: category.id,
       categoryName: safeCatName,
       categoryIcon: safeCatIcon,
-      isPublic: true,
       subcategories: childSubs,
       bookmarks: catBookmarks,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-    };
+    });
+
+    setSharedCategories((prev) =>
+      existing
+        ? prev.map((s) => (s.id === saved.id ? saved : s))
+        : [...prev, saved]
+    );
+
+    if (!existing) {
+      trackEvent('share_category', {
+        category_id: category.id,
+        bookmark_count: catBookmarks.length,
+      });
+    }
+
+    return saved;
   };
 
   const handleRevokeShare = async (shareId: string): Promise<void> => {
     if (!user) return;
-    try {
-      await deleteDoc(doc(db, 'sharedCategories', shareId));
-    } catch (error) {
-      handleFirestoreError(
-        error,
-        OperationType.DELETE,
-        `sharedCategories/${shareId}`
-      );
-    }
+    await apiClient.revokeShare(shareId);
+    setSharedCategories((prev) => prev.filter((s) => s.id !== shareId));
   };
 
   const handleExitShareView = () => {
@@ -2829,43 +2126,22 @@ export default function App() {
       );
     }
 
-    // Persist to Firestore atomically using writeBatch so onSnapshot fires only ONCE
+    // Persist atomically to Cloud SQL PostgreSQL
     if (user) {
-      try {
-        const batch = writeBatch(db);
-        for (const sib of reorderedSiblings) {
-          if (sib.id === draggedId && draggedCat.parentId !== newParentId) {
-            batch.update(doc(db, 'categories', sib.id), {
-              parentId: newParentId,
-              order: sib.order,
-              updatedAt: serverTimestamp(),
-            });
-          } else {
-            batch.update(doc(db, 'categories', sib.id), {
-              order: sib.order,
-              updatedAt: serverTimestamp(),
-            });
-          }
-        }
-        let extraIdx = reorderedSiblings.length;
-        for (const childSub of childSubsToMove) {
-          batch.update(doc(db, 'categories', childSub.id), {
-            parentId: newParentId,
-            order: extraIdx++,
-            updatedAt: serverTimestamp(),
-          });
-        }
-        for (const bmUpd of bookmarksToUpdate) {
-          batch.update(doc(db, 'bookmarks', bmUpd.id), {
-            categoryId: bmUpd.categoryId,
-            subcategoryId: bmUpd.subcategoryId,
-            updatedAt: serverTimestamp(),
-          });
-        }
-        await batch.commit();
-      } catch (error) {
-        handleFirestoreError(error, OperationType.UPDATE, `categories/${draggedId}`);
-      }
+      let extraIdx = reorderedSiblings.length;
+      await apiClient.reorderCategoryTree({
+        draggedId,
+        newParentId,
+        reorderedSiblings: reorderedSiblings.map((sib) => ({
+          id: sib.id,
+          order: sib.order,
+        })),
+        childSubsToMove: childSubsToMove.map((childSub) => ({
+          id: childSub.id,
+          order: extraIdx++,
+        })),
+        bookmarksToUpdate,
+      });
     }
   };
 
@@ -3579,10 +2855,10 @@ export default function App() {
                   ) : (
                     <button
                       type="button"
-                      onClick={() => void handleGoogleLogin()}
+                      onClick={() => openAuthPage('login')}
                       className="text-[11px] font-semibold accent-text hover:underline cursor-pointer shrink-0"
                     >
-                      Login
+                      Log in
                     </button>
                   )}
                 </div>
@@ -3858,9 +3134,9 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() =>
-                    void (user ? handleSignOut() : handleGoogleLogin())
+                    user ? void handleSignOut() : openAuthPage('login')
                   }
-                  title={user ? `Signed in as ${user.email} (click to sign out)` : 'Login with Google to sync'}
+                  title={user ? `Signed in as ${user.email} (click to sign out)` : 'Log in to sync'}
                   className="w-11 h-11 rounded-2xl bg-slate-950/60 border border-white/10 hover:border-white/25 flex items-center justify-center text-slate-300 hover:text-white transition-colors cursor-pointer"
                 >
                   <Cloud className={`w-4 h-4 ${user ? 'accent-text' : 'text-slate-500'}`} />
@@ -3898,7 +3174,7 @@ export default function App() {
               settings={settings}
               onUpdateSettings={handleUpdateSettings}
               user={user}
-              onSignIn={handleGoogleLogin}
+              onSignIn={async () => openAuthPage('login')}
               onSignOut={handleSignOut}
               onResetDefaults={handleClearEntireWorkspace}
               existingCategoryCount={categories.length}
@@ -3964,23 +3240,14 @@ export default function App() {
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2 shrink-0">
-                  <button
-                    type="button"
-                    onClick={() => setActiveView('chrome-sync')}
-                    className="min-h-[38px] px-3.5 py-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-slate-200 hover:text-white text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0"
-                  >
-                    <Chrome className="w-3.5 h-3.5 accent-text" />
-                    <span>Sync Chrome</span>
-                  </button>
-
                   {!user && (
                     <button
                       type="button"
-                      onClick={() => void handleGoogleLogin()}
+                      onClick={() => openAuthPage('login')}
                       className="min-h-[38px] px-3.5 py-2 rounded-xl accent-subtle-bg hover:bg-white/15 border accent-border accent-text text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0"
                     >
                       <LogIn className="w-3.5 h-3.5" />
-                      <span>Login</span>
+                      <span>Log in</span>
                     </button>
                   )}
 
@@ -4434,11 +3701,11 @@ export default function App() {
                         {!user && (
                           <button
                             type="button"
-                            onClick={() => void handleGoogleLogin()}
+                            onClick={() => openAuthPage('login')}
                             className="min-h-[44px] px-5 py-2.5 rounded-xl accent-subtle-bg hover:bg-white/15 border accent-border accent-text text-xs sm:text-sm font-semibold flex items-center gap-2 cursor-pointer"
                           >
                             <LogIn className="w-4 h-4" />
-                            <span>Login with Google</span>
+                            <span>Log in</span>
                           </button>
                         )}
                       </>
@@ -4935,7 +4202,10 @@ export default function App() {
           bookmarks={bookmarks}
           existingShare={sharedByCategoryId[sharingCategory.id] || null}
           user={user}
-          onSignIn={handleGoogleLogin}
+          onSignIn={async () => {
+            setSharingCategory(null);
+            openAuthPage('login');
+          }}
           onPublishOrUpdateShare={handlePublishOrUpdateShare}
           onRevokeShare={handleRevokeShare}
           onPreviewSharedPage={handleOpenSharePreview}
@@ -4975,6 +4245,17 @@ export default function App() {
         onKeepLocalOnly={handleChoiceKeepLocalOnly}
         onGetCloudAndSync={handleChoiceGetCloudAndSync}
         onStartFresh={handleChoiceStartFresh}
+      />
+
+      <AuthPage
+        isOpen={Boolean(authPageMode && !user)}
+        mode={authPageMode || 'login'}
+        onModeChange={(nextMode) => setAuthPageMode(nextMode)}
+        onClose={closeAuthPage}
+        onGoogleLogin={handleGoogleLogin}
+        onEmailLogin={handleEmailLogin}
+        onEmailRegister={handleEmailRegister}
+        onPasswordReset={handlePasswordReset}
       />
     </div>
   );

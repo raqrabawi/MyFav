@@ -13,8 +13,7 @@ import {
   Star,
   Sun,
 } from 'lucide-react';
-import { doc, getDoc } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../firebase';
+import { apiClient } from '../lib/apiClient';
 import { BookmarkItem, SharedCategoryRecord, ThemeMode } from '../types';
 import { CategoryIcon, WebsiteFavicon } from './CategoryIcon';
 import { MyFavLogo } from './MyFavLogo';
@@ -47,21 +46,15 @@ export const SharedCollectionView: React.FC<SharedCollectionViewProps> = ({
       setLoading(true);
       setNotFound(false);
       try {
-        const snap = await getDoc(doc(db, 'sharedCategories', shareId));
+        const d = await apiClient.getPublicShare(shareId);
         if (cancelled) return;
-        if (!snap.exists()) {
-          setNotFound(true);
-          setSharedData(null);
-          return;
-        }
-        const d = snap.data();
         if (!d || d.isPublic === false) {
           setNotFound(true);
           setSharedData(null);
           return;
         }
         setSharedData({
-          id: snap.id,
+          id: d.id,
           ownerId: d.ownerId || '',
           categoryId: d.categoryId || '',
           categoryName: d.categoryName || 'Curated Collection',
@@ -69,20 +62,13 @@ export const SharedCollectionView: React.FC<SharedCollectionViewProps> = ({
           isPublic: Boolean(d.isPublic),
           subcategories: Array.isArray(d.subcategories) ? d.subcategories : [],
           bookmarks: Array.isArray(d.bookmarks) ? d.bookmarks : [],
-          createdAt: '',
-          updatedAt: '',
+          createdAt: d.createdAt || '',
+          updatedAt: d.updatedAt || '',
         });
-      } catch (error) {
+      } catch {
         if (!cancelled) {
-          try {
-            handleFirestoreError(
-              error,
-              OperationType.GET,
-              `sharedCategories/${shareId}`
-            );
-          } catch {
-            setNotFound(true);
-          }
+          setNotFound(true);
+          setSharedData(null);
         }
       } finally {
         if (!cancelled) {

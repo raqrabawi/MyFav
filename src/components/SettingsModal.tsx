@@ -1024,12 +1024,12 @@ export const SettingsModal: React.FC<SettingsPageProps> = ({
                 </div>
                 <div>
                   <h2 className="text-sm sm:text-base font-semibold text-slate-100">
-                    {user ? 'Google Account Connected' : 'Local Workspace'}
+                    {user ? 'Account Connected' : 'Local Workspace'}
                   </h2>
                   <p className="text-xs text-slate-400 mt-0.5">
                     {user
                       ? `Signed in as ${user.email} · Cloud sync is active across all devices.`
-                      : 'Sign in with Google to sync your bookmarks across desktop and mobile.'}
+                      : 'Log in with Google or email & password to sync your bookmarks across desktop and mobile.'}
                   </p>
                 </div>
               </div>
@@ -1049,7 +1049,7 @@ export const SettingsModal: React.FC<SettingsPageProps> = ({
                   onClick={onSignIn}
                   className="min-h-[40px] px-4 py-2 rounded-xl accent-bg text-white text-xs font-semibold transition-colors cursor-pointer shrink-0"
                 >
-                  Connect Google
+                  Log in
                 </button>
               )}
             </div>
