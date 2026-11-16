@@ -3903,6 +3903,9 @@ export default function App() {
               onResetDefaults={handleClearEntireWorkspace}
               existingCategoryCount={categories.length}
               existingBookmarkCount={bookmarks.length}
+              categories={categories}
+              bookmarks={bookmarks}
+              quickShortcuts={quickShortcuts}
               onImportExactPlan={handleImportExactChromePlan}
               onClearEntireWorkspace={handleClearEntireWorkspace}
               defaultTab={activeView === 'chrome-sync' ? 'sync' : 'appearance'}

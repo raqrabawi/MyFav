@@ -276,7 +276,75 @@ export function parseChromeBookmarksExactArrangement(
         }
       };
 
-      if (Array.isArray(parsedJson)) {
+      if (
+        parsedJson &&
+        typeof parsedJson === 'object' &&
+        parsedJson.format === 'myfav-backup' &&
+        parsedJson.data &&
+        Array.isArray(parsedJson.data.categories) &&
+        Array.isArray(parsedJson.data.bookmarks)
+      ) {
+        const rawCats = parsedJson.data.categories as Array<{
+          id?: string;
+          name?: string;
+          icon?: string;
+          parentId?: string;
+          order?: number;
+        }>;
+        const rawBookmarks = parsedJson.data.bookmarks as Array<{
+          title?: string;
+          url?: string;
+          categoryId?: string;
+          subcategoryId?: string;
+        }>;
+
+        const rootMap = new Map<string, ExtractedChromeCategory>();
+        const subMap = new Map<string, ExtractedChromeCategory>();
+
+        for (const cat of [...rawCats]
+          .filter((c) => !c.parentId)
+          .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))) {
+          if (!cat.id || !cat.name) continue;
+          const created = getOrCreateRootCategory(cat.name);
+          if (cat.icon) created.icon = cat.icon;
+          rootMap.set(cat.id, created);
+        }
+
+        for (const sub of [...rawCats]
+          .filter((c) => Boolean(c.parentId))
+          .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))) {
+          if (!sub.id || !sub.name || !sub.parentId) continue;
+          const parent = rootMap.get(sub.parentId);
+          if (!parent) continue;
+          const created = getOrCreateSubcategory(parent.tempId, sub.name);
+          if (sub.icon) created.icon = sub.icon;
+          subMap.set(sub.id, created);
+        }
+
+        for (const bm of rawBookmarks) {
+          const href = (bm.url || '').trim();
+          if (!/^https?:\/\/.+/i.test(href)) continue;
+          const title = (bm.title || href).trim();
+          const rootCat =
+            (bm.categoryId ? rootMap.get(bm.categoryId) : undefined) ||
+            getOrCreateRootCategory(inferFallbackCategoryName(href, title));
+          const subCat = bm.subcategoryId ? subMap.get(bm.subcategoryId) : undefined;
+
+          bookmarks.push({
+            title: title.slice(0, 120),
+            url: href.slice(0, 500),
+            categoryTempId: rootCat.tempId,
+            subcategoryTempId: subCat ? subCat.tempId : '',
+            categoryName: rootCat.name,
+            subcategoryName: subCat ? subCat.name : '',
+            order: bookmarks.length,
+          });
+        }
+
+        if (bookmarks.length > 0 || categories.length > 0) {
+          return { categories, bookmarks };
+        }
+      } else if (Array.isArray(parsedJson)) {
         // chrome.bookmarks.getTree() array
         for (const rootNode of parsedJson) {
           walkJsonNode(rootNode, []);

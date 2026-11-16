@@ -24,12 +24,19 @@ import {
   Link2,
   Unlink,
   Zap,
+  FileSpreadsheet,
+  FileCode2,
+  Braces,
+  HardDriveDownload,
 } from 'lucide-react';
 import { User } from 'firebase/auth';
 import {
+  BookmarkItem,
   CardDensity,
+  CategoryItem,
   GlassIntensity,
   ImportProgressState,
+  QuickShortcutItem,
   THEME_PRESETS,
   ThemeMode,
   UserSettings,
@@ -44,6 +51,8 @@ import {
   generateBookmarkletHref,
   isFileSystemAccessSupported,
 } from '../utils/chromeLiveSync';
+import { BackupFormat, triggerBackupDownload } from '../utils/backupExport';
+import { trackEvent } from '../utils/analytics';
 import { ImportProgressPanel } from './ImportProgressPanel';
 
 interface SettingsPageProps {
@@ -56,6 +65,9 @@ interface SettingsPageProps {
   onResetDefaults: () => Promise<void>;
   existingCategoryCount: number;
   existingBookmarkCount: number;
+  categories: CategoryItem[];
+  bookmarks: BookmarkItem[];
+  quickShortcuts?: QuickShortcutItem[];
   onImportExactPlan: (
     plan: ChromeImportPlan,
     replaceAllExisting: boolean,
@@ -86,6 +98,9 @@ export const SettingsModal: React.FC<SettingsPageProps> = ({
   onResetDefaults,
   existingCategoryCount,
   existingBookmarkCount,
+  categories,
+  bookmarks,
+  quickShortcuts = [],
   onImportExactPlan,
   onClearEntireWorkspace,
   defaultTab = 'appearance',
@@ -122,6 +137,32 @@ export const SettingsModal: React.FC<SettingsPageProps> = ({
   const [pasteContent, setPasteContent] = useState('');
   const [showConfirmClear, setShowConfirmClear] = useState(false);
   const [isClearing, setIsClearing] = useState(false);
+  const [backupNotice, setBackupNotice] = useState<{
+    format: BackupFormat;
+    filename: string;
+    count: number;
+  } | null>(null);
+
+  const hasExportableData = bookmarks.length > 0 || categories.length > 0;
+
+  const handleExportBackup = (format: BackupFormat) => {
+    const result = triggerBackupDownload(format, {
+      categories,
+      bookmarks,
+      quickShortcuts,
+      settings,
+    });
+    setBackupNotice({
+      format,
+      filename: result.filename,
+      count: bookmarks.length,
+    });
+    trackEvent('backup_export', {
+      format,
+      bookmark_count: bookmarks.length,
+      category_count: categories.length,
+    });
+  };
 
   const appOrigin = typeof window !== 'undefined' ? window.location.origin : '';
   const bookmarkletHref = generateBookmarkletHref(appOrigin);
@@ -258,7 +299,7 @@ export const SettingsModal: React.FC<SettingsPageProps> = ({
           </button>
           <h1 className="text-2xl font-bold tracking-tight text-slate-100">Settings</h1>
           <p className="text-xs sm:text-sm text-slate-400 mt-0.5">
-            Manage your workspace theme, Chrome bookmarks sync, and Google account.
+            Manage your workspace theme, Chrome bookmarks sync, backups, and Google account.
           </p>
         </div>
 
@@ -1032,6 +1073,124 @@ export const SettingsModal: React.FC<SettingsPageProps> = ({
                 <p className="text-xs text-slate-400 mt-0.5">Websites Saved</p>
               </div>
             </div>
+          </section>
+
+          {/* Backup & Export Section */}
+          <section className="glass-surface rounded-2xl p-5 sm:p-6 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-2">
+              <div className="flex items-start gap-3">
+                <div className="w-10 h-10 rounded-xl accent-subtle-bg flex items-center justify-center accent-text shrink-0">
+                  <HardDriveDownload className="w-5 h-5" />
+                </div>
+                <div>
+                  <h2 className="text-sm sm:text-base font-semibold text-slate-100">Backup</h2>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    Download your bookmarks as a browser-ready HTML bookmark file, CSV spreadsheet, or full JSON backup.
+                  </p>
+                </div>
+              </div>
+              <span className="text-xs font-mono-tabular text-slate-400 shrink-0 sm:pt-1">
+                {existingBookmarkCount} sites · {existingCategoryCount} folders
+              </span>
+            </div>
+
+            {backupNotice && (
+              <div className="p-3.5 rounded-xl accent-subtle-bg border accent-border text-xs text-slate-100 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <CheckCircle2 className="w-4 h-4 accent-text shrink-0" />
+                  <span className="truncate">
+                    Exported <span className="font-mono">{backupNotice.filename}</span> ({backupNotice.count} {backupNotice.count === 1 ? 'website' : 'websites'}).
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setBackupNotice(null)}
+                  className="text-[11px] text-slate-300 hover:text-white shrink-0 cursor-pointer"
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <button
+                type="button"
+                disabled={!hasExportableData}
+                onClick={() => handleExportBackup('html')}
+                className="chrome-sync-btn p-4 rounded-xl bg-slate-950/60 border border-white/10 text-left flex flex-col justify-between gap-4 cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed"
+              >
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="w-8 h-8 rounded-lg accent-subtle-bg flex items-center justify-center accent-text shrink-0">
+                      <FileCode2 className="w-4 h-4" />
+                    </span>
+                    <span className="text-[11px] font-mono text-slate-400">.html</span>
+                  </div>
+                  <h3 className="text-sm font-semibold text-slate-100 pt-1">HTML Bookmark Backup</h3>
+                  <p className="text-[11px] text-slate-400 leading-relaxed">
+                    Standard bookmark format for Chrome, Safari, Firefox, Edge, or re-importing into MyFav.
+                  </p>
+                </div>
+                <span className="inline-flex items-center gap-1.5 text-xs font-semibold accent-text">
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Export HTML</span>
+                </span>
+              </button>
+
+              <button
+                type="button"
+                disabled={!hasExportableData}
+                onClick={() => handleExportBackup('csv')}
+                className="chrome-sync-btn p-4 rounded-xl bg-slate-950/60 border border-white/10 text-left flex flex-col justify-between gap-4 cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed"
+              >
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="w-8 h-8 rounded-lg accent-subtle-bg flex items-center justify-center accent-text shrink-0">
+                      <FileSpreadsheet className="w-4 h-4" />
+                    </span>
+                    <span className="text-[11px] font-mono text-slate-400">.csv</span>
+                  </div>
+                  <h3 className="text-sm font-semibold text-slate-100 pt-1">CSV Spreadsheet</h3>
+                  <p className="text-[11px] text-slate-400 leading-relaxed">
+                    Clean spreadsheet table with title, URL, category, subcategory, favorite status, and notes.
+                  </p>
+                </div>
+                <span className="inline-flex items-center gap-1.5 text-xs font-semibold accent-text">
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Export CSV</span>
+                </span>
+              </button>
+
+              <button
+                type="button"
+                disabled={!hasExportableData}
+                onClick={() => handleExportBackup('json')}
+                className="chrome-sync-btn p-4 rounded-xl bg-slate-950/60 border border-white/10 text-left flex flex-col justify-between gap-4 cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed"
+              >
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="w-8 h-8 rounded-lg accent-subtle-bg flex items-center justify-center accent-text shrink-0">
+                      <Braces className="w-4 h-4" />
+                    </span>
+                    <span className="text-[11px] font-mono text-slate-400">.json</span>
+                  </div>
+                  <h3 className="text-sm font-semibold text-slate-100 pt-1">JSON Full Backup</h3>
+                  <p className="text-[11px] text-slate-400 leading-relaxed">
+                    Complete structured workspace backup including folders, websites, quick shortcuts, and theme settings.
+                  </p>
+                </div>
+                <span className="inline-flex items-center gap-1.5 text-xs font-semibold accent-text">
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Export JSON</span>
+                </span>
+              </button>
+            </div>
+
+            {!hasExportableData && (
+              <p className="text-[11px] text-slate-400">
+                Add at least one website or category to enable backup exports.
+              </p>
+            )}
           </section>
 
           {/* Danger Zone: Clear Data */}
